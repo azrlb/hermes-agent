@@ -271,15 +271,42 @@ def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
 DEFAULT_CRASH_GRACE_SECONDS = 30
 
 
-# Sentinel exit code a kanban worker uses to signal "I bailed because the
-# provider rate-limited / exhausted quota, not because the task failed."
-# The dispatcher's reap classifier maps this to a ``rate_limited`` exit kind
-# so ``detect_crashed_workers`` can release the task back to ``ready``
-# WITHOUT counting a failure (the circuit breaker must never trip on a
-# transient throttle). 75 == BSD ``EX_TEMPFAIL`` (sysexits.h) — the
-# conventional "temporary failure, retry later" code, and well clear of the
-# 0/1/2 codes the worker uses for success / generic failure / usage error.
-KANBAN_RATE_LIMIT_EXIT_CODE = 75
+# Sentinel exit code a kanban worker uses to signal temporary provider
+# unavailability. This includes throttling, overload, server failures, and
+# transport timeouts. It intentionally excludes billing and authentication:
+# those require operator action and must flow through the bounded failure and
+# escalation path instead of retrying forever.
+KANBAN_CAPACITY_WAIT_EXIT_CODE = 75
+# Backwards-compatible public name used by older callers and tests.
+KANBAN_RATE_LIMIT_EXIT_CODE = KANBAN_CAPACITY_WAIT_EXIT_CODE
+
+_KANBAN_TRANSIENT_FAILURE_REASONS = frozenset(
+    {
+        "rate_limit",
+        "upstream_rate_limit",
+        "overloaded",
+        "server_error",
+        "timeout",
+    }
+)
+
+
+def kanban_worker_exit_code(result: Any, is_kanban_worker: bool) -> int:
+    """Map an agent result to the process exit contract.
+
+    Exit 75 is reserved for a dispatcher-owned worker whose provider is
+    temporarily unavailable. All other failures remain exit 1 so permission,
+    billing, authentication, and product defects still consume the bounded
+    repair/escalation budget.
+    """
+    if not isinstance(result, Mapping) or not result.get("failed"):
+        return 0
+    reason = result.get("failure_reason")
+    if hasattr(reason, "value"):
+        reason = reason.value
+    if is_kanban_worker and str(reason or "") in _KANBAN_TRANSIENT_FAILURE_REASONS:
+        return KANBAN_CAPACITY_WAIT_EXIT_CODE
+    return 1
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -6840,10 +6867,11 @@ class DispatchResult:
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
     rate_limited: list[str] = field(default_factory=list)
-    """Task ids whose workers bailed on a provider rate-limit / quota wall
-    (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
-    counting a failure. These never trip the circuit breaker — a long quota
-    window just makes the task bounce cheaply until the window clears."""
+    """Legacy telemetry for workers requeued by older rate-limit runs."""
+    capacity_wait: list[str] = field(default_factory=list)
+    """Task ids neutrally requeued after temporary provider unavailability.
+    These never trip the circuit breaker; the cooldown spaces out probes until
+    capacity or transport recovers."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -6856,13 +6884,39 @@ class DispatchResult:
 # reap loop at the top of ``dispatch_once`` and consulted by
 # ``detect_crashed_workers`` to classify a dead-pid task.
 #
-# Entry: ``pid -> (raw_wait_status, reaped_at_epoch)``. We keep raw status
-# so both ``os.WIFEXITED`` / ``os.WEXITSTATUS`` and ``os.WIFSIGNALED`` can
-# be consulted. Entries are trimmed by age (and total size cap as a
-# belt-and-braces against unbounded growth on exotic platforms).
+# Entry: ``pid -> (kind, code, observed_at_epoch)`` where kind is ``exit`` or
+# ``signal``. Normalizing at collection time makes classification portable to
+# Windows, where the POSIX wait-status helpers do not exist.
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
-_recent_worker_exits: "dict[int, tuple[int, float]]" = {}
+_recent_worker_exits: "dict[int, tuple[str, int, float]]" = {}
+_recent_worker_exits_lock = threading.RLock()
+_worker_processes: "dict[int, subprocess.Popen]" = {}
+_worker_processes_lock = threading.Lock()
+
+
+def _trim_worker_exits(now: float) -> None:
+    if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX // 2:
+        cutoff = now - _RECENT_WORKER_EXIT_TTL_SECONDS
+        for pid in [p for p, (_k, _c, t) in _recent_worker_exits.items() if t < cutoff]:
+            _recent_worker_exits.pop(pid, None)
+    if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX:
+        ordered = sorted(_recent_worker_exits.items(), key=lambda item: item[1][2])
+        for pid, _ in ordered[: len(ordered) // 2]:
+            _recent_worker_exits.pop(pid, None)
+
+
+def _record_worker_returncode(pid: int, returncode: int) -> None:
+    """Record a cross-platform ``Popen.returncode`` for classification."""
+    if not pid or pid <= 0:
+        return
+    now = time.time()
+    with _recent_worker_exits_lock:
+        if returncode < 0:
+            _recent_worker_exits[int(pid)] = ("signal", abs(int(returncode)), now)
+        else:
+            _recent_worker_exits[int(pid)] = ("exit", int(returncode), now)
+        _trim_worker_exits(now)
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
@@ -6873,19 +6927,18 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
     """
     if not pid or pid <= 0:
         return
-    now = time.time()
-    _recent_worker_exits[int(pid)] = (int(raw_status), now)
-    # Age-based trim: drop entries older than the TTL.
-    if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX // 2:
-        cutoff = now - _RECENT_WORKER_EXIT_TTL_SECONDS
-        for _pid in [p for p, (_s, t) in _recent_worker_exits.items() if t < cutoff]:
-            _recent_worker_exits.pop(_pid, None)
-    # Size cap as a final guard.
-    if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX:
-        # Drop oldest half.
-        ordered = sorted(_recent_worker_exits.items(), key=lambda kv: kv[1][1])
-        for _pid, _ in ordered[: len(ordered) // 2]:
-            _recent_worker_exits.pop(_pid, None)
+    try:
+        if hasattr(os, "WIFEXITED") and os.WIFEXITED(raw_status):
+            _record_worker_returncode(pid, os.WEXITSTATUS(raw_status))
+            return
+        if hasattr(os, "WIFSIGNALED") and os.WIFSIGNALED(raw_status):
+            _record_worker_returncode(pid, -os.WTERMSIG(raw_status))
+            return
+    except (OSError, ValueError):
+        pass
+    # Compatibility callers may provide a conventional POSIX raw exit status
+    # even on Windows.
+    _record_worker_returncode(pid, int(raw_status) >> 8)
 
 
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
@@ -6897,37 +6950,33 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       task is still ``running`` in the DB, this is a protocol violation
       (worker exited without calling ``kanban_complete`` / ``kanban_block``)
       and should be auto-blocked immediately — retrying will just loop.
-    * ``"rate_limited"`` — ``WIFEXITED`` with status
-      ``KANBAN_RATE_LIMIT_EXIT_CODE``. The worker bailed because the
-      provider rate-limited / exhausted quota, NOT because the task failed.
-      ``detect_crashed_workers`` releases the task back to ``ready`` without
-      counting a failure, so a long quota window can't trip the breaker.
+    * ``"capacity_wait"`` — the worker exited with the temporary-failure
+      sentinel because provider capacity or transport was unavailable.
+      ``detect_crashed_workers`` releases the task to ``ready`` without
+      counting a failure.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
       something else, or died between reap tick and liveness check). Fall
       back to existing crashed-counter behavior.
 
-    ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
+    ``code`` is the exit status (for ``clean_exit`` / ``capacity_wait`` /
     ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
     for ``unknown``.
     """
-    entry = _recent_worker_exits.get(int(pid))
+    with _recent_worker_exits_lock:
+        entry = _recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
-    raw, _ = entry
-    try:
-        if os.WIFEXITED(raw):
-            code = os.WEXITSTATUS(raw)
-            if code == 0:
-                return ("clean_exit", 0)
-            if code == KANBAN_RATE_LIMIT_EXIT_CODE:
-                return ("rate_limited", code)
-            return ("nonzero_exit", code)
-        if os.WIFSIGNALED(raw):
-            return ("signaled", os.WTERMSIG(raw))
-    except Exception:
-        pass
+    exit_kind, code, _ = entry
+    if exit_kind == "signal":
+        return ("signaled", code)
+    if exit_kind == "exit":
+        if code == 0:
+            return ("clean_exit", 0)
+        if code == KANBAN_CAPACITY_WAIT_EXIT_CODE:
+            return ("capacity_wait", code)
+        return ("nonzero_exit", code)
     return ("unknown", None)
 
 
@@ -6935,9 +6984,24 @@ def reap_worker_zombies() -> "list[int]":
     """Reap all zombie children of this process without blocking.
 
     Returns the list of reaped PIDs. Safe to call when there are no
-    children (returns []). No-op on Windows.
+    children (returns []). Registered ``Popen`` handles are polled on every
+    platform; POSIX also reaps unregistered children for compatibility.
     """
     reaped: "list[int]" = []
+    with _worker_processes_lock:
+        tracked = list(_worker_processes.items())
+    for pid, proc in tracked:
+        try:
+            returncode = proc.poll()
+        except Exception:
+            continue
+        if returncode is None:
+            continue
+        _record_worker_returncode(pid, int(returncode))
+        with _worker_processes_lock:
+            _worker_processes.pop(pid, None)
+        reaped.append(pid)
+
     if os.name != "nt":
         try:
             while True:
@@ -6948,10 +7012,99 @@ def reap_worker_zombies() -> "list[int]":
                 if pid == 0:
                     break
                 _record_worker_exit(pid, status)
-                reaped.append(pid)
+                if pid not in reaped:
+                    reaped.append(pid)
         except Exception:
             pass
     return reaped
+
+
+def _worker_exit_record_path(
+    task_id: str,
+    run_id: int,
+    *,
+    board: Optional[str] = None,
+) -> Path:
+    """Return the deterministic, board-scoped durable worker exit record."""
+    safe_task = re.sub(r"[^A-Za-z0-9_.-]+", "_", task_id).strip("._") or "task"
+    safe_task = safe_task[:48]
+    digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:10]
+    return worker_logs_dir(board=board) / (
+        f".{safe_task}-{digest}-run-{int(run_id)}.exit.json"
+    )
+
+
+def write_kanban_worker_exit_record(exit_code: int) -> None:
+    """Atomically persist this worker's exit result when dispatch supplied a path.
+
+    The record lets a restarted gateway distinguish a temporary capacity wait
+    from a task crash after its in-memory ``Popen`` registry has been lost.
+    Invalid or incomplete dispatcher context is ignored; the ordinary crash
+    path remains the safe fallback.
+    """
+    raw_path = os.environ.get("HERMES_KANBAN_EXIT_RECORD", "").strip()
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+    if not raw_path or not task_id or not run_id:
+        return
+    try:
+        run_number = int(run_id)
+        target = Path(raw_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "taskId": task_id,
+            "runId": run_number,
+            "pid": os.getpid(),
+            "exitCode": int(exit_code),
+            "finishedAt": int(time.time()),
+        }
+        temporary = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, target)
+    except (OSError, TypeError, ValueError):
+        _log.debug("kanban worker: could not persist exit record", exc_info=True)
+
+
+def _classify_durable_worker_exit(
+    task_id: str,
+    run_id: Optional[int],
+    pid: int,
+    *,
+    board: Optional[str] = None,
+    run_started_at: Optional[int] = None,
+) -> "tuple[str, Optional[int]]":
+    """Validate and classify a durable record for the exact task/run/pid."""
+    if run_id is None:
+        return ("unknown", None)
+    path = _worker_exit_record_path(task_id, int(run_id), board=board)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return ("unknown", None)
+    finished_at = payload.get("finishedAt")
+    if (
+        payload.get("version") != 1
+        or payload.get("taskId") != task_id
+        or payload.get("runId") != int(run_id)
+        or payload.get("pid") != int(pid)
+        or not isinstance(finished_at, int)
+        or not isinstance(payload.get("exitCode"), int)
+    ):
+        return ("unknown", None)
+    # Permit small clock granularity/skew, but reject records that predate the
+    # exact run or claim to come from the future.
+    if (
+        (run_started_at is not None and finished_at < int(run_started_at) - 5)
+        or finished_at > int(time.time()) + 300
+    ):
+        return ("unknown", None)
+    code = int(payload["exitCode"])
+    if code == 0:
+        return ("clean_exit", 0)
+    if code == KANBAN_CAPACITY_WAIT_EXIT_CODE:
+        return ("capacity_wait", code)
+    return ("nonzero_exit", code)
 
 
 def _pid_alive(pid: Optional[int]) -> bool:
@@ -7566,8 +7719,9 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ``detect_crashed_workers`` just closed — and counts how many in a row were
     clean-exit protocol violations:
 
-    * ``rate_limited`` runs are neutral and skipped: a quota wall says nothing
-      about the task, exactly as it is neutral for the unified
+    * ``rate_limited`` and ``capacity_wait`` runs are neutral and skipped:
+      provider availability says nothing about the task, exactly as it is
+      neutral for the unified
       ``consecutive_failures`` counter.
     * Any other closed run (completed, plain crash, timeout, spawn failure,
       reclaim, …) breaks the streak, so the bounded retry budget counts ONLY
@@ -7588,7 +7742,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
+        if outcome in ("rate_limited", "capacity_wait"):
             continue
         if outcome == "crashed":
             is_violation = False
@@ -7609,7 +7763,11 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and drops the task back to ``ready``.
@@ -7628,17 +7786,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     on the first occurrence — retrying a worker whose CLI keeps
     returning 0 without a terminal transition just loops forever.
 
-    When the reap registry shows the worker exited with the rate-limit
-    sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
-    provider quota wall, NOT a task failure. Such tasks are released back
-    to ``ready`` WITHOUT counting a failure (so a long quota window can't
-    trip the breaker) and stamped with a quota-blocker error so
-    ``check_respawn_guard`` defers their respawn until the window clears.
-    The ids are returned via the ``_last_rate_limited`` function attribute
-    (the public return stays the crashed-only ``list[str]``).
+    When the worker exits with the temporary-failure sentinel, it is waiting
+    on provider capacity or transport rather than failing the story. Such
+    tasks return to ``ready`` without counting a failure, and the respawn
+    guard spaces out retries. The public return remains the crashed-only
+    ``list[str]``; neutral ids are exposed on ``_last_capacity_wait``.
     """
     crashed: list[str] = []
-    rate_limited: list[str] = []
+    capacity_wait: list[str] = []
+    consumed_exit_records: list[Path] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -7649,8 +7805,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "SELECT t.id, t.worker_pid, t.claim_lock, t.started_at, "
+            "t.current_run_id, r.started_at AS run_started_at FROM tasks t "
+            "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -7671,7 +7829,18 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
-            rate_limited_exit = False
+            if kind == "unknown":
+                kind, code = _classify_durable_worker_exit(
+                    row["id"], row["current_run_id"], pid, board=board,
+                    run_started_at=row["run_started_at"],
+                )
+                if kind != "unknown" and row["current_run_id"] is not None:
+                    consumed_exit_records.append(
+                        _worker_exit_record_path(
+                            row["id"], int(row["current_run_id"]), board=board,
+                        )
+                    )
+            capacity_wait_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -7699,21 +7868,19 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     # the violation-only retry budget is derived later.
                     "protocol_violation": True,
                 }
-            elif kind == "rate_limited":
-                # Worker bailed because the provider rate-limited / exhausted
-                # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
-                # the task is fine, the account just hit a wall. Release it
-                # back to ``ready`` so the respawn guard defers it until the
-                # quota window clears, and crucially do NOT count a failure
-                # (skip ``_record_task_failure``) so a long quota window can't
-                # trip the circuit breaker and permanently block the card.
+            elif kind == "capacity_wait":
+                # Provider capacity or transport is temporarily unavailable.
+                # This is NOT a task failure. Release it to ``ready`` without
+                # touching the failure counter and let the cooldown pace the
+                # next probe.
                 protocol_violation = False
-                rate_limited_exit = True
+                capacity_wait_exit = True
                 error_text = (
-                    f"pid {pid} exited rate-limited (quota wall) — "
+                    f"pid {pid} exited for temporary provider capacity or "
+                    f"transport unavailability — "
                     f"requeued without counting a failure"
                 )
-                event_kind = "rate_limited"
+                event_kind = "capacity_wait"
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
@@ -7741,10 +7908,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 (row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
-                # Rate-limited requeues are a clean release, not a crash —
-                # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # Capacity waits are a neutral release, not a story crash.
+                _run_outcome = "capacity_wait" if capacity_wait_exit else "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -7756,17 +7921,14 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload,
                     run_id=run_id,
                 )
-                if rate_limited_exit:
-                    # Stamp the failure-error column so ``check_respawn_guard``
-                    # recognizes this as a quota blocker and defers the
-                    # respawn until the window clears — WITHOUT touching
-                    # ``consecutive_failures`` (that's the whole point: no
-                    # breaker trip on a throttle).
+                if capacity_wait_exit:
+                    # Stamp a readable status for board surfaces while leaving
+                    # ``consecutive_failures`` unchanged.
                     conn.execute(
                         "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                         (error_text[:500], row["id"]),
                     )
-                    rate_limited.append(row["id"])
+                    capacity_wait.append(row["id"])
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget
@@ -7873,9 +8035,19 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # and tests that destructure the result; ``dispatch_once`` reads this
     # side-channel attribute to populate ``DispatchResult.auto_blocked``.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
-    # Same side-channel for rate-limited requeues — these did NOT count a
+    # Same side-channel for neutral capacity waits — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
-    detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_capacity_wait = capacity_wait  # type: ignore[attr-defined]
+    # Compatibility for integrations that consumed the old side channel.
+    detect_crashed_workers._last_rate_limited = capacity_wait  # type: ignore[attr-defined]
+    # The database event is now durable. Best-effort removal bounds hidden
+    # per-run files; a crash before this point leaves the record available for
+    # the next gateway to consume idempotently.
+    for exit_record in consumed_exit_records:
+        try:
+            exit_record.unlink(missing_ok=True)
+        except OSError:
+            _log.debug("kanban worker: could not remove consumed exit record %s", exit_record)
     return crashed
 
 
@@ -8160,10 +8332,10 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     now = int(time.time())
 
-    # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
-    #    (quota wall) — defer while inside the cooldown window, then allow a
-    #    cheap probe. Must run BEFORE the blocker_auth regex check, because a
-    #    rate-limit requeue stamps a quota-flavored last_failure_error that
+    # 1. Capacity-wait cooldown. The most recent run ended in a neutral
+    #    temporary-provider outcome — defer inside the cooldown window, then
+    #    allow a cheap probe. This runs before blocker detection because the
+    #    requeue stamps a provider-flavored last_failure_error that
     #    the regex would otherwise match → defer forever (no failure counter
     #    increment on this path means the breaker can never free it).
     #
@@ -8179,7 +8351,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     ).fetchone()
     if (
         latest_run is not None
-        and latest_run["outcome"] == "rate_limited"
+        and latest_run["outcome"] in ("rate_limited", "capacity_wait")
     ):
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, and skip the
@@ -8188,7 +8360,9 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return None
         ended_at = latest_run["ended_at"]
         if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
-            return "rate_limit_cooldown"
+            if latest_run["outcome"] == "rate_limited":
+                return "rate_limit_cooldown"
+            return "capacity_wait_cooldown"
         # Cooldown elapsed — allow the respawn. Return early so the
         # blocker_auth check below doesn't catch the rate-limit text we
         # stamped on the task; this path intentionally retries forever
@@ -8386,11 +8560,11 @@ def _dispatch_once_locked(
     """Run one dispatcher tick.
 
     Steps:
-      1. Reclaim stale running tasks (TTL expired).
-      2. Reclaim stale running tasks (no recent heartbeat).
-      3. Reclaim crashed running tasks (host-local PID no longer alive).
-      3. Promote todo -> ready where all parents are done.
-      4. For each ready task with an assignee, atomically claim and call
+      1. Classify crashed workers, including durable restart exit records.
+      2. Reclaim stale running tasks (TTL expired).
+      3. Reconcile orphaned running tasks and stale heartbeats.
+      4. Promote todo -> ready where all parents are done.
+      5. For each ready task with an assignee, atomically claim and call
          ``spawn_fn(task, workspace_path, board) -> Optional[int]``. The
          return value (if any) is recorded as ``worker_pid`` so subsequent
          ticks can detect crashes before the TTL expires.
@@ -8416,6 +8590,11 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    # Classify dead workers before stale-claim recovery. After a gateway
+    # restart, the durable exit record may be the only proof that an expired
+    # claim ended in a neutral provider-capacity wait rather than a story
+    # crash. Reclaiming first would close that run and discard the proof.
+    result.crashed = detect_crashed_workers(conn, board=board)
     result.reclaimed = release_stale_claims(conn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
@@ -8425,7 +8604,6 @@ def _dispatch_once_locked(
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
-    result.crashed = detect_crashed_workers(conn)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -8434,14 +8612,15 @@ def _dispatch_once_locked(
     )
     if _crash_auto_blocked:
         result.auto_blocked.extend(_crash_auto_blocked)
-    # Rate-limited requeues (quota wall, no failure counted) — surface for
-    # telemetry / tests. These tasks went back to ``ready`` and the respawn
-    # guard will defer them until the quota window clears.
-    _crash_rate_limited = getattr(
-        detect_crashed_workers, "_last_rate_limited", []
+    # Neutral provider-capacity waits — surface for telemetry and tests. These
+    # tasks went back to ``ready`` and the respawn guard paces their retry.
+    _capacity_wait = getattr(
+        detect_crashed_workers, "_last_capacity_wait", []
     )
-    if _crash_rate_limited:
-        result.rate_limited.extend(_crash_rate_limited)
+    if _capacity_wait:
+        result.capacity_wait.extend(_capacity_wait)
+        # Older dashboards and API consumers read this field directly.
+        result.rate_limited.extend(_capacity_wait)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
@@ -9182,6 +9361,14 @@ def _default_spawn(
     # board slug still forces it to the right directory.
     resolved_board = _normalize_board_slug(board) or get_current_board()
     env["HERMES_KANBAN_BOARD"] = resolved_board
+    if task.current_run_id is not None:
+        env["HERMES_KANBAN_EXIT_RECORD"] = str(
+            _worker_exit_record_path(
+                task.id,
+                int(task.current_run_id),
+                board=resolved_board,
+            )
+        )
     # HERMES_PROFILE is the author the kanban_comment tool defaults to.
     # `hermes -p <assignee>` activates the profile, but the env var is
     # what the tool reads — set it explicitly here so comments are
@@ -9235,13 +9422,11 @@ def _default_spawn(
         "chat",
         "-q", prompt,
     ])
-    if task.goal_mode:
-        # Goal-mode workers must take the fully-quiet single-query path:
-        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-        # cli.py's quiet branch. Without -Q the worker gets exactly one
-        # turn, prints text, exits rc=0, and the dispatcher records a
-        # protocol violation (incident 2026-06-09 t_d9cbe312).
-        cmd.append("-Q")
+    # Every dispatcher-owned worker must take the fully-quiet single-query
+    # path. That path owns the worker exit contract and durable exit record;
+    # the ordinary human-facing ``-q`` path exposes only response text and
+    # cannot distinguish a provider outage from a successful turn.
+    cmd.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -9271,6 +9456,9 @@ def _default_spawn(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    if callable(getattr(proc, "poll", None)):
+        with _worker_processes_lock:
+            _worker_processes[int(proc.pid)] = proc
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's
