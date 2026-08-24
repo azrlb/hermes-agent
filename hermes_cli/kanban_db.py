@@ -7455,10 +7455,10 @@ def enforce_max_runtime(
     return timed_out
 
 
-# Heartbeat staleness heartbeat gap — if a running task hasn't sent a
-# heartbeat in this many seconds it's considered inactive regardless of
-# the ``dispatch_stale_timeout_seconds`` threshold.  Hardcoded at 1 hour
-# to match the original spec (">4h started + no commits in 1h").
+# Heartbeat staleness backstop for installations that keep the default
+# multi-hour running-age threshold. A deliberately shorter configured
+# threshold must also shorten this gap; otherwise a documented ten-minute
+# recovery setting still waits an undocumented hour before doing anything.
 _STALE_HEARTBEAT_GAP_SECONDS = 3600
 
 
@@ -7476,8 +7476,9 @@ def detect_stale_running(
     1. It has been running for longer than ``stale_timeout_seconds``
        (measured from the active run's ``started_at``, falling back to
        ``tasks.started_at`` on older runs).
-    2. Its ``last_heartbeat_at`` is older than
-       ``_STALE_HEARTBEAT_GAP_SECONDS`` (or NULL — never sent a heartbeat).
+    2. Its ``last_heartbeat_at`` is older than the smaller of
+       ``stale_timeout_seconds`` and ``_STALE_HEARTBEAT_GAP_SECONDS`` (or
+       NULL — never sent a heartbeat).
 
     On reclaim the task is reset to ``ready``, the run is closed with
     ``outcome='stale'``, and the host-local worker (if still running) is
@@ -7495,6 +7496,10 @@ def detect_stale_running(
 
 
     now = int(time.time())
+    heartbeat_gap_seconds = min(
+        int(stale_timeout_seconds),
+        _STALE_HEARTBEAT_GAP_SECONDS,
+    )
     reclaimed: list[str] = []
 
     rows = conn.execute(
@@ -7516,7 +7521,7 @@ def detect_stale_running(
 
         last_hb = row["last_heartbeat_at"]
         hb_age = (now - int(last_hb)) if last_hb is not None else None
-        if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
+        if hb_age is not None and hb_age < heartbeat_gap_seconds:
             continue  # recent heartbeat → still alive
 
         pid = row["worker_pid"]
@@ -7557,6 +7562,7 @@ def detect_stale_running(
                 "heartbeat_age_seconds": (
                     int(hb_age) if hb_age is not None else None
                 ),
+                "heartbeat_gap_seconds": heartbeat_gap_seconds,
                 "timeout_seconds": stale_timeout_seconds,
                 "pid": int(pid) if pid else None,
             }

@@ -1257,6 +1257,76 @@ def _set_task_status(conn: sqlite3.Connection, task_id: str, status: str) -> Non
 # ---------------------------------------------------------------------------
 
 
+def test_short_stale_timeout_reclaims_after_same_heartbeat_gap(
+    kanban_home, monkeypatch,
+):
+    """A short configured recovery window must not retain the one-hour floor."""
+    now = 5_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="silent provider call", assignee="coder",
+        )
+        kb.claim_task(conn, task_id, claimer="remote-host:worker")
+        run_id = kb.get_task(conn, task_id).current_run_id
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ?, started_at = ?, "
+            "last_heartbeat_at = ? WHERE id = ?",
+            (12345, now - 601, now - 601, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ?, last_heartbeat_at = ? "
+            "WHERE id = ?",
+            (now - 601, now - 601, run_id),
+        )
+
+        assert kb.detect_stale_running(
+            conn,
+            stale_timeout_seconds=600,
+            signal_fn=lambda _pid, _signal: None,
+        ) == [task_id]
+
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready"
+        stale_event = next(
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "stale"
+        )
+        assert stale_event.payload["heartbeat_age_seconds"] == 601
+        assert stale_event.payload["heartbeat_gap_seconds"] == 600
+
+
+def test_short_stale_timeout_preserves_worker_with_recent_heartbeat(
+    kanban_home, monkeypatch,
+):
+    """Long runtime alone never reclaims a worker that is still heartbeating."""
+    now = 6_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="active long task", assignee="coder")
+        kb.claim_task(conn, task_id, claimer="remote-host:worker")
+        run_id = kb.get_task(conn, task_id).current_run_id
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ?, started_at = ?, "
+            "last_heartbeat_at = ? WHERE id = ?",
+            (12346, now - 1200, now - 30, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ?, last_heartbeat_at = ? "
+            "WHERE id = ?",
+            (now - 1200, now - 30, run_id),
+        )
+
+        assert kb.detect_stale_running(
+            conn,
+            stale_timeout_seconds=600,
+            signal_fn=lambda _pid, _signal: None,
+        ) == []
+        assert kb.get_task(conn, task_id).status == "running"
+
+
 
 
 # ---------------------------------------------------------------------------
