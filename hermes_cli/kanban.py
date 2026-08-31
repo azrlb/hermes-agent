@@ -2754,6 +2754,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         # fallback the gateway-embedded dispatcher applies, so behaviour
         # matches regardless of which path runs the tick.
         max_in_progress = kb.resolve_max_in_progress(max_in_progress)
+        try:
+            stale_timeout_seconds = max(
+                0, int(_kanban_cfg.get("dispatch_stale_timeout_seconds", 0) or 0)
+            )
+        except (TypeError, ValueError):
+            stale_timeout_seconds = 0
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
         cli_max = getattr(args, "max", None)
@@ -2764,6 +2770,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
+        stale_timeout_seconds = 0
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
@@ -2772,6 +2779,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             max_spawn=max_spawn,
             max_in_progress=max_in_progress,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
+            stale_timeout_seconds=stale_timeout_seconds,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
