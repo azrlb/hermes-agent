@@ -1266,6 +1266,48 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         conn.close()
 
 
+def test_reclaim_task_keeps_claim_when_worker_survives_termination(kanban_home, monkeypatch):
+    """Manual reclaim must not free capacity while the old worker is alive."""
+    import secrets
+    import time
+    import hermes_cli.kanban_db as _kb
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="unkillable", assignee="broken")
+        lock = f"{_kb._claimer_id().split(':', 1)[0]}:{secrets.token_hex(8)}"
+        future = int(time.time()) + 3600
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, worker_pid=? WHERE id=?",
+            (lock, future, 12345, task_id),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, worker_pid, started_at) "
+            "VALUES (?, 'running', ?, ?, ?, ?)",
+            (task_id, lock, future, 12345, int(time.time())),
+        )
+        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, task_id))
+        conn.commit()
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+
+        assert kb.reclaim_task(conn, task_id, reason="controller cancel", signal_fn=lambda *_: None) is False
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_pid FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        assert row["status"] == "running"
+        assert row["claim_lock"] == lock
+        assert row["worker_pid"] == 12345
+        event = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert event["kind"] == "reclaim_deferred"
+        assert "manual_reclaim_worker_alive" in event["payload"]
+    finally:
+        conn.close()
+
+
 
 
 
@@ -1406,5 +1448,4 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
 
