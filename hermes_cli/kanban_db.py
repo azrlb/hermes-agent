@@ -4702,6 +4702,61 @@ def reclaim_task(
     return True
 
 
+def stop_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    signal_fn=None,
+) -> dict[str, Any]:
+    """Stop a host-local worker and terminally park its task.
+
+    The task is moved to ``blocked`` only after the worker is proven gone. If
+    termination does not succeed, its running claim remains held so a caller
+    cannot acknowledge shutdown and free external capacity prematurely.
+    """
+    if not reason or reason.strip() != reason or len(reason) > 500:
+        raise ValueError("stop reason must be non-empty, trimmed, and at most 500 characters")
+    row = conn.execute(
+        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if not row:
+        return {"stopped": False, "reason": "not_found"}
+    if row["status"] in ("done", "archived", "blocked") and row["claim_lock"] is None:
+        return {"stopped": True, "status": row["status"], "already_terminal": True}
+
+    prev_lock = row["claim_lock"]
+    termination = _terminate_reclaimed_worker(
+        row["worker_pid"], prev_lock, signal_fn=signal_fn,
+    )
+    if _worker_survived_termination(termination):
+        _defer_reclaim_for_live_worker(
+            conn, task_id, prev_lock, int(time.time()), termination,
+            reason="stop_worker_alive",
+        )
+        return {"stopped": False, "reason": "worker_alive", **termination}
+
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL, completed_at=? WHERE id=? AND claim_lock IS ?",
+            (now, task_id, prev_lock),
+        )
+        if cur.rowcount != 1:
+            return {"stopped": False, "reason": "ownership_changed"}
+        run_id = _end_run(
+            conn, task_id, outcome="cancelled", status="blocked",
+            error=f"controller_stop: {reason}", metadata=termination,
+        )
+        _append_event(
+            conn, task_id, "cancelled",
+            {"reason": reason, "prev_lock": prev_lock, **termination},
+            run_id=run_id,
+        )
+    return {"stopped": True, "status": "blocked", **termination}
+
+
 def reassign_task(
     conn: sqlite3.Connection,
     task_id: str,

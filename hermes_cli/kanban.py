@@ -506,6 +506,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Human-readable reason (recorded on the reclaimed event)",
     )
 
+    p_stop = sub.add_parser(
+        "stop",
+        help="Stop a worker and terminally park its task without requeueing",
+    )
+    p_stop.add_argument("task_id")
+    p_stop.add_argument("--reason", required=True)
+    p_stop.add_argument("--json", action="store_true")
+
     p_reassign = sub.add_parser(
         "reassign",
         help="Reassign a task to a different profile, optionally reclaiming first",
@@ -1051,6 +1059,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "assign":   _cmd_assign,
             "set-model": _cmd_set_model,
             "reclaim":  _cmd_reclaim,
+            "stop":     _cmd_stop,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
             "diag":     _cmd_diagnostics,
@@ -1119,6 +1128,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "swarm",
     "assign",
     "reclaim",
+    "stop",
     "reassign",
     "link",
     "unlink",
@@ -1837,6 +1847,18 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
         return 1
     print(f"Reclaimed {args.task_id}")
     return 0
+
+
+def _cmd_stop(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        result = kb.stop_task(conn, args.task_id, reason=args.reason)
+    if getattr(args, "json", False):
+        print(json.dumps(result))
+    elif result.get("stopped"):
+        print(f"Stopped {args.task_id}")
+    else:
+        print(f"Could not stop {args.task_id}: {result.get('reason', 'unknown')}", file=sys.stderr)
+    return 0 if result.get("stopped") else 1
 
 
 def _cmd_reassign(args: argparse.Namespace) -> int:
