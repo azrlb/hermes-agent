@@ -1308,6 +1308,56 @@ def test_reclaim_task_keeps_claim_when_worker_survives_termination(kanban_home, 
         conn.close()
 
 
+def test_stop_task_acknowledges_only_after_worker_is_gone(kanban_home, monkeypatch):
+    import signal
+    import secrets
+    import time
+    import hermes_cli.kanban_db as _kb
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="stop me", assignee="worker")
+        lock = f"{_kb._claimer_id().split(':', 1)[0]}:{secrets.token_hex(8)}"
+        future = int(time.time()) + 3600
+        state = {"alive": True}
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: state["alive"])
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, worker_pid=? WHERE id=?",
+            (lock, future, 12345, task_id),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, worker_pid, started_at) "
+            "VALUES (?, 'running', ?, ?, ?, ?)",
+            (task_id, lock, future, 12345, int(time.time())),
+        )
+        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, task_id))
+        conn.commit()
+
+        def survives(_pid, _sig):
+            return None
+
+        refused = kb.stop_task(conn, task_id, reason="controller cancel", signal_fn=survives)
+        assert refused["stopped"] is False
+        assert refused["reason"] == "worker_alive"
+        assert kb.get_task(conn, task_id).status == "running"
+
+        def stops(_pid, sig):
+            if sig == signal.SIGTERM:
+                state["alive"] = False
+
+        accepted = kb.stop_task(conn, task_id, reason="controller cancel", signal_fn=stops)
+        assert accepted["stopped"] is True
+        assert accepted["status"] == "blocked"
+        task = kb.get_task(conn, task_id)
+        assert task.status == "blocked"
+        assert task.worker_pid is None
+        replay = kb.stop_task(conn, task_id, reason="controller cancel", signal_fn=stops)
+        assert replay == {"stopped": True, "status": "blocked", "already_terminal": True}
+    finally:
+        conn.close()
+
+
 
 
 
@@ -1448,4 +1498,3 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
