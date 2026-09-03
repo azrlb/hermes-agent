@@ -1352,6 +1352,11 @@ def test_stop_task_acknowledges_only_after_worker_is_gone(kanban_home, monkeypat
         task = kb.get_task(conn, task_id)
         assert task.status == "blocked"
         assert task.worker_pid is None
+        # A controller cancellation is terminal until an operator explicitly
+        # unblocks it.  The dispatcher must not promote it back to ready on
+        # the next recompute tick and spawn a replacement worker.
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, task_id).status == "blocked"
         replay = kb.stop_task(conn, task_id, reason="controller cancel", signal_fn=stops)
         assert replay == {"stopped": True, "status": "blocked", "already_terminal": True}
     finally:
