@@ -13,6 +13,7 @@ loop continues instead of exiting.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterable, Optional
 
@@ -66,6 +67,59 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     return False
 
 
+def session_succeeded_kanban_terminal(messages: Iterable[dict] | None) -> bool:
+    """True only after a terminal tool returned its structured success result."""
+    if not messages:
+        return False
+    for msg in reversed(list(messages)):
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        if str(msg.get("name") or "") not in _TERMINAL_KANBAN_TOOLS:
+            continue
+        content = msg.get("content")
+        try:
+            result = json.loads(content) if isinstance(content, str) else content
+        except (TypeError, ValueError):
+            return False
+        return isinstance(result, dict) and result.get("ok") is True
+    return False
+
+
+def reap_kanban_worker_descendants(timeout_seconds: float = 3.0) -> bool:
+    """Stop every descendant before a terminal kanban worker exits.
+
+    The worker has already recorded its terminal result and will run no more
+    model turns, so its background subprocesses have no legitimate work left.
+    Re-scan to a fixed point because one child can briefly create another while
+    termination is in progress.  False means at least one descendant survived;
+    the caller must make the worker exit abnormally so the controller holds.
+    """
+    if not kanban_stop_nudge_enabled():
+        return True
+    try:
+        import psutil
+        parent = psutil.Process(os.getpid())
+        for _attempt in range(3):
+            children = parent.children(recursive=True)
+            if not children:
+                return True
+            for child in reversed(children):
+                try:
+                    child.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            _gone, alive = psutil.wait_procs(children, timeout=timeout_seconds)
+            for child in alive:
+                try:
+                    child.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            psutil.wait_procs(alive, timeout=timeout_seconds)
+        return not parent.children(recursive=True)
+    except Exception:
+        return False
+
+
 def build_kanban_stop_nudge(
     *,
     messages: Iterable[dict] | None = None,
@@ -104,5 +158,7 @@ def build_kanban_stop_nudge(
 __all__ = [
     "build_kanban_stop_nudge",
     "kanban_stop_nudge_enabled",
+    "reap_kanban_worker_descendants",
     "session_called_kanban_terminal",
+    "session_succeeded_kanban_terminal",
 ]

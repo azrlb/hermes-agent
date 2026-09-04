@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -1257,6 +1258,13 @@ class Run:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     worker_pid: Optional[int]
+    process_started_at: Optional[int]
+    worker_exited_at: Optional[int]
+    worker_exit_code: Optional[int]
+    worker_exit_kind: Optional[str]
+    worker_exit_delivery_attempts: int
+    worker_exit_delivered_at: Optional[int]
+    worker_exit_delivery_error: Optional[str]
     max_runtime_seconds: Optional[int]
     last_heartbeat_at: Optional[int]
     started_at: int
@@ -1281,6 +1289,39 @@ class Run:
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             worker_pid=row["worker_pid"],
+            process_started_at=(
+                int(row["process_started_at"])
+                if "process_started_at" in row.keys() and row["process_started_at"] is not None
+                else None
+            ),
+            worker_exited_at=(
+                int(row["worker_exited_at"])
+                if "worker_exited_at" in row.keys() and row["worker_exited_at"] is not None
+                else None
+            ),
+            worker_exit_code=(
+                int(row["worker_exit_code"])
+                if "worker_exit_code" in row.keys() and row["worker_exit_code"] is not None
+                else None
+            ),
+            worker_exit_kind=(
+                row["worker_exit_kind"]
+                if "worker_exit_kind" in row.keys() else None
+            ),
+            worker_exit_delivery_attempts=(
+                int(row["worker_exit_delivery_attempts"])
+                if "worker_exit_delivery_attempts" in row.keys() and row["worker_exit_delivery_attempts"] is not None
+                else 0
+            ),
+            worker_exit_delivered_at=(
+                int(row["worker_exit_delivered_at"])
+                if "worker_exit_delivered_at" in row.keys() and row["worker_exit_delivered_at"] is not None
+                else None
+            ),
+            worker_exit_delivery_error=(
+                row["worker_exit_delivery_error"]
+                if "worker_exit_delivery_error" in row.keys() else None
+            ),
             max_runtime_seconds=row["max_runtime_seconds"],
             last_heartbeat_at=row["last_heartbeat_at"],
             started_at=int(row["started_at"]),
@@ -1465,6 +1506,13 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
+    process_started_at  INTEGER,
+    worker_exited_at    INTEGER,
+    worker_exit_code    INTEGER,
+    worker_exit_kind    TEXT,
+    worker_exit_delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    worker_exit_delivered_at INTEGER,
+    worker_exit_delivery_error TEXT,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
     started_at          INTEGER NOT NULL,
@@ -2786,6 +2834,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
     ).fetchone() is not None
     if runs_exist:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        for name, definition in (
+            ("process_started_at", "process_started_at INTEGER"),
+            ("worker_exited_at", "worker_exited_at INTEGER"),
+            ("worker_exit_code", "worker_exit_code INTEGER"),
+            ("worker_exit_kind", "worker_exit_kind TEXT"),
+            ("worker_exit_delivery_attempts", "worker_exit_delivery_attempts INTEGER NOT NULL DEFAULT 0"),
+            ("worker_exit_delivered_at", "worker_exit_delivered_at INTEGER"),
+            ("worker_exit_delivery_error", "worker_exit_delivery_error TEXT"),
+        ):
+            if name not in run_cols:
+                _add_column_if_missing(conn, "task_runs", name, definition)
         with write_txn(conn):
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
@@ -2884,7 +2946,11 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
-        " worker_pid INTEGER, max_runtime_seconds INTEGER,"
+        " worker_pid INTEGER, process_started_at INTEGER,"
+        " worker_exited_at INTEGER, worker_exit_code INTEGER,"
+        " worker_exit_kind TEXT, worker_exit_delivery_attempts INTEGER NOT NULL DEFAULT 0,"
+        " worker_exit_delivered_at INTEGER, worker_exit_delivery_error TEXT,"
+        " max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",
@@ -4368,8 +4434,7 @@ def _end_run(
                metadata      = ?,
                ended_at      = ?,
                claim_lock    = NULL,
-               claim_expires = NULL,
-               worker_pid    = NULL
+               claim_expires = NULL
          WHERE id = ?
            AND ended_at IS NULL
         """,
@@ -5901,6 +5966,18 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             (task_id,),
         ).fetchone()
         if not row:
+            return
+        pending_exit = conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+            "AND outcome IN ('completed', 'blocked') AND worker_pid IS NOT NULL "
+            "AND worker_exited_at IS NULL LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if pending_exit:
+            _log.debug(
+                "Deferring workspace cleanup for task %s until its exact worker exit is certified",
+                task_id,
+            )
             return
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
@@ -8062,6 +8139,10 @@ class DispatchResult:
     "task is genuinely stuck"."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
+    worker_exits_certified: list[str] = field(default_factory=list)
+    """Task ids whose terminal worker exit was durably certified this tick."""
+    worker_exits_delivered: list[str] = field(default_factory=list)
+    """Task ids whose signed exit callback was acknowledged this tick."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
     timed_out: list[str] = field(default_factory=list)
@@ -8106,6 +8187,22 @@ class DispatchResult:
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
+_recent_worker_exit_codes: "dict[int, tuple[int, float]]" = {}
+_live_worker_processes: "dict[int, Any]" = {}
+
+
+def _process_started_at(pid: int) -> int:
+    """Return the OS process start time in epoch milliseconds."""
+    try:
+        import psutil
+        return int(psutil.Process(int(pid)).create_time() * 1000)
+    except Exception:
+        return int(time.time() * 1000)
+
+
+def _record_worker_exit_code(pid: int, exit_code: int) -> None:
+    if pid > 0:
+        _recent_worker_exit_codes[int(pid)] = (int(exit_code), time.time())
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
@@ -8117,6 +8214,7 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
     if not pid or pid <= 0:
         return
     now = time.time()
+    _recent_worker_exit_codes.pop(int(pid), None)
     _recent_worker_exits[int(pid)] = (int(raw_status), now)
     # Age-based trim: drop entries older than the TTL.
     if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX // 2:
@@ -8155,6 +8253,14 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
     for ``unknown``.
     """
+    direct = _recent_worker_exit_codes.get(int(pid))
+    if direct is not None:
+        code = direct[0]
+        if code == 0:
+            return ("clean_exit", 0)
+        if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+            return ("rate_limited", code)
+        return ("nonzero_exit", code)
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
@@ -8181,6 +8287,15 @@ def reap_worker_zombies() -> "list[int]":
     children (returns []). No-op on Windows.
     """
     reaped: "list[int]" = []
+    for pid, process in list(_live_worker_processes.items()):
+        try:
+            code = process.poll()
+        except Exception:
+            code = None
+        if code is not None:
+            _record_worker_exit_code(pid, code)
+            _live_worker_processes.pop(pid, None)
+            reaped.append(pid)
     if os.name != "nt":
         try:
             while True:
@@ -8810,6 +8925,260 @@ _PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
 _PROTOCOL_VIOLATION_SCAN_LIMIT = 50
 
 
+def _same_process_instance(pid: int, expected_started_at: Optional[int]) -> bool:
+    """True only when PID still names the exact process Hermes spawned."""
+    if not _pid_alive(pid):
+        return False
+    if expected_started_at is None:
+        return True
+    try:
+        import psutil
+        actual = int(psutil.Process(int(pid)).create_time() * 1000)
+        return actual == int(expected_started_at)
+    except Exception:
+        # If the OS will not reveal the creation time, liveness is the safer
+        # answer: never certify an exit merely because identity probing failed.
+        return True
+
+
+def certify_terminal_worker_exits(conn: sqlite3.Connection) -> list[str]:
+    """Persist proof that a logically terminal run's exact process is gone.
+
+    Completion and process exit are deliberately separate facts.  A worker can
+    write a terminal task result and continue running for another turn.  Closed
+    runs retain their PID and OS creation time; this reconciliation pass marks
+    the exit only after that exact process instance is no longer alive.  The
+    write is idempotent and the observer hook fires strictly after commit.
+    """
+    certified: list[str] = []
+    payloads: list[dict] = []
+    rows = conn.execute(
+        "SELECT r.id, r.task_id, r.profile, r.outcome, r.worker_pid, "
+        "r.process_started_at, t.idempotency_key AS dispatch_id "
+        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.ended_at IS NOT NULL AND r.worker_pid IS NOT NULL "
+        "AND r.outcome IN ('completed', 'blocked') "
+        "AND r.worker_exited_at IS NULL ORDER BY r.id"
+    ).fetchall()
+    for row in rows:
+        pid = int(row["worker_pid"])
+        started_at = row["process_started_at"]
+        if _same_process_instance(pid, started_at):
+            continue
+        kind, code = _classify_worker_exit(pid)
+        exit_code = int(code) if code is not None else -1
+        exited_at = int(time.time() * 1000)
+        identity = {
+            "task_id": row["task_id"],
+            "run_id": int(row["id"]),
+            "worker_pid": pid,
+            "process_started_at": int(started_at) if started_at is not None else None,
+            "worker_exited_at": exited_at,
+            "worker_exit_code": exit_code,
+            "worker_exit_kind": kind,
+            "terminal_result": row["outcome"],
+            "dispatch_id": row["dispatch_id"],
+        }
+        certificate_id = hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE task_runs SET worker_exited_at = ?, worker_exit_code = ?, "
+                "worker_exit_kind = ? WHERE id = ? AND worker_exited_at IS NULL",
+                (exited_at, exit_code, kind, int(row["id"])),
+            )
+            if cur.rowcount != 1:
+                continue
+            event_payload = {**identity, "certificate_id": certificate_id}
+            _append_event(
+                conn, row["task_id"], "worker_exit_certified",
+                event_payload, run_id=int(row["id"]),
+            )
+        certified.append(row["task_id"])
+        payloads.append({
+            **identity,
+            "certificate_id": certificate_id,
+            "assignee": row["profile"],
+            "outcome": row["outcome"],
+            "exit_kind": kind,
+            "exit_code": exit_code,
+            "exited_at": exited_at,
+        })
+    if payloads and _kanban_observer_consumed("on_kanban_worker_exited"):
+        board = get_current_board()
+        for payload in payloads:
+            fields = dict(payload)
+            task_id = fields.pop("task_id")
+            _fire_kanban_lifecycle_hook(
+                "on_kanban_worker_exited", task_id, board=board, **fields,
+            )
+    for task_id in dict.fromkeys(certified):
+        task = get_task(conn, task_id)
+        if task is not None and task.status == "done":
+            _cleanup_workspace(conn, task_id)
+    return certified
+
+
+_CONTROLLER_LIFECYCLE_MARKER = re.compile(
+    r"<!--\s*codex-bmad-lifecycle\s+({.*?})\s*-->", re.DOTALL,
+)
+_WORKER_EXIT_DELIVERY_LIMIT = 5
+
+
+def _post_json(url: str, payload: dict) -> dict:
+    import urllib.request
+
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}, method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310 - opt-in controller URL
+        data = response.read()
+        if response.status < 200 or response.status >= 300:
+            raise RuntimeError(f"controller returned HTTP {response.status}")
+    parsed = json.loads(data.decode("utf-8"))
+    if not isinstance(parsed, dict):
+        raise RuntimeError("controller returned a non-object response")
+    return parsed
+
+
+def deliver_worker_exit_certificates(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    key_id: Optional[str] = None,
+    secret: Optional[str] = None,
+    transport=None,
+) -> list[str]:
+    """Deliver signed exit callbacks with a bounded, durable retry budget.
+
+    Delivery is opt-in: the dispatcher needs a lifecycle key id and either a
+    secret argument (tests) or ``HERMES_WORKER_EXIT_CALLBACK_SECRET_FILE``.
+    A missed/exhausted callback never erases the certificate; controller polling
+    reads the same run fields as the durable fallback.
+    """
+    resolved_key = (key_id or os.environ.get("HERMES_WORKER_EXIT_CALLBACK_KEY_ID") or "").strip()
+    resolved_secret = secret
+    if resolved_secret is None:
+        secret_file = (os.environ.get("HERMES_WORKER_EXIT_CALLBACK_SECRET_FILE") or "").strip()
+        if secret_file:
+            try:
+                resolved_secret = Path(secret_file).read_text(encoding="utf-8").strip()
+            except OSError:
+                resolved_secret = None
+    if not resolved_key or not resolved_secret:
+        return []
+    send = transport or _post_json
+    rows = conn.execute(
+        "SELECT r.*, t.body, t.idempotency_key FROM task_runs r "
+        "JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.worker_exited_at IS NOT NULL AND r.worker_exited_at > 0 "
+        "AND r.worker_exit_delivered_at IS NULL "
+        "AND r.worker_exit_delivery_attempts < ? ORDER BY r.id",
+        (_WORKER_EXIT_DELIVERY_LIMIT,),
+    ).fetchall()
+    delivered: list[str] = []
+    for row in rows:
+        marker_match = _CONTROLLER_LIFECYCLE_MARKER.search(row["body"] or "")
+        if not marker_match:
+            continue
+        try:
+            marker = json.loads(marker_match.group(1))
+            state_url = str(marker["stateUrl"])
+            submit_url = str(marker["submitUrl"])
+            dispatch_id = str(marker["dispatchId"])
+            controller_run_id = str(marker["controllerRunId"])
+            dispatch_sequence = int(marker["eventSequence"])
+            state = send(state_url, {})
+            event_sequence = int(state["expectedEventSequence"])
+            terminal_result = (
+                "done" if row["outcome"] == "completed"
+                else "blocked" if row["outcome"] == "blocked"
+                else "failed"
+            )
+            certificate_facts = {
+                "dispatch_id": dispatch_id,
+                "process_started_at": int(row["process_started_at"]),
+                "run_id": int(row["id"]),
+                "task_id": row["task_id"],
+                "terminal_result": row["outcome"],
+                "worker_exit_code": int(row["worker_exit_code"]),
+                "worker_exit_kind": row["worker_exit_kind"],
+                "worker_exited_at": int(row["worker_exited_at"]),
+                "worker_pid": int(row["worker_pid"]),
+            }
+            certificate_id = hashlib.sha256(
+                json.dumps(certificate_facts, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            event = {
+                "sequence": event_sequence,
+                "type": "worker-exited",
+                "certificate": {
+                    "certificateId": certificate_id,
+                    "issuerId": resolved_key,
+                    "identity": {
+                        "controllerRunId": controller_run_id,
+                        "eventSequence": dispatch_sequence,
+                        "dispatchId": dispatch_id,
+                        "hermesBoard": _normalize_board_slug(board) or get_current_board(),
+                        "hermesTaskId": row["task_id"],
+                        "hermesRunId": str(row["id"]),
+                        "workerPid": int(row["worker_pid"]),
+                        "processStartedAt": int(row["process_started_at"]),
+                    },
+                    "terminalResult": terminal_result,
+                    "exitCode": int(row["worker_exit_code"]),
+                    "exitedAt": int(row["worker_exited_at"]),
+                    "source": "callback",
+                },
+            }
+            unsigned = {
+                "keyId": resolved_key,
+                "algorithm": "hmac-sha256",
+                "issuedAt": int(time.time()),
+                "nonce": secrets.token_hex(16),
+                "permissions": ["lifecycle"],
+                "payload": event,
+            }
+            signature = hmac.new(
+                resolved_secret.encode("utf-8"),
+                json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            acknowledgement = send(submit_url, {**unsigned, "signature": signature})
+            if acknowledgement.get("accepted") is not True:
+                raise RuntimeError("controller did not acknowledge the lifecycle event")
+        except Exception as exc:
+            with write_txn(conn):
+                attempts = int(row["worker_exit_delivery_attempts"] or 0) + 1
+                conn.execute(
+                    "UPDATE task_runs SET worker_exit_delivery_attempts = ?, "
+                    "worker_exit_delivery_error = ? WHERE id = ?",
+                    (attempts, str(exc)[:500], int(row["id"])),
+                )
+                _append_event(
+                    conn, row["task_id"],
+                    "worker_exit_delivery_abandoned" if attempts >= _WORKER_EXIT_DELIVERY_LIMIT else "worker_exit_delivery_failed",
+                    {"attempt": attempts, "limit": _WORKER_EXIT_DELIVERY_LIMIT},
+                    run_id=int(row["id"]),
+                )
+            continue
+        with write_txn(conn):
+            delivered_at = int(time.time() * 1000)
+            conn.execute(
+                "UPDATE task_runs SET worker_exit_delivery_attempts = worker_exit_delivery_attempts + 1, "
+                "worker_exit_delivered_at = ?, worker_exit_delivery_error = NULL WHERE id = ?",
+                (delivered_at, int(row["id"])),
+            )
+            _append_event(
+                conn, row["task_id"], "worker_exit_delivered",
+                {"delivered_at": delivered_at}, run_id=int(row["id"]),
+            )
+        delivered.append(row["task_id"])
+    return delivered
+
+
 def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     """Count the task's trailing run of clean-exit protocol violations.
 
@@ -9361,6 +9730,7 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
     """
+    process_started_at = _process_started_at(int(pid))
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET worker_pid = ? WHERE id = ?",
@@ -9369,10 +9739,14 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         run_id = _current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
+                "UPDATE task_runs SET worker_pid = ?, process_started_at = ? WHERE id = ?",
+                (int(pid), process_started_at, run_id),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        _append_event(
+            conn, task_id, "spawned",
+            {"pid": int(pid), "process_started_at": process_started_at},
+            run_id=run_id,
+        )
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -9866,6 +10240,10 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
         )
+        if not dry_run:
+            result.worker_exits_delivered = deliver_worker_exit_certificates(
+                conn, board=board,
+            )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
     with _dispatch_tick_lock(db_path) as held:
@@ -9894,6 +10272,10 @@ def dispatch_once(
     # strictly OUTSIDE the single-writer critical section (#56066 sweeper
     # finding / #64231 disposition): a slow subscriber must never extend
     # the lock hold and stall a sibling dispatcher's tick.
+    if not dry_run and not result.skipped_locked:
+        result.worker_exits_delivered = deliver_worker_exit_certificates(
+            conn, board=board,
+        )
     _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
 
@@ -9953,6 +10335,7 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    result.worker_exits_certified = certify_terminal_worker_exits(conn)
     result.reclaimed = release_stale_claims(conn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
@@ -10929,6 +11312,7 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+    _live_worker_processes[int(proc.pid)] = proc
     return proc.pid
 
 

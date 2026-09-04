@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import sys
+import types
+
 import pytest
 
 from agent.kanban_stop import (
     build_kanban_stop_nudge,
     kanban_stop_nudge_enabled,
+    reap_kanban_worker_descendants,
     session_called_kanban_terminal,
+    session_succeeded_kanban_terminal,
 )
 
 
@@ -74,6 +79,78 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+def test_only_a_successful_terminal_result_requests_immediate_worker_exit():
+    completed = [
+        {"role": "assistant", "tool_calls": [{
+            "id": "1", "type": "function",
+            "function": {"name": "kanban_complete", "arguments": "{}"},
+        }]},
+        {"role": "tool", "name": "kanban_complete", "tool_call_id": "1", "content": '{"ok": true, "run_id": 7}'},
+    ]
+    rejected = [
+        completed[0],
+        {"role": "tool", "name": "kanban_complete", "tool_call_id": "1", "content": '{"error": "still running"}'},
+    ]
+    assert session_succeeded_kanban_terminal(completed) is True
+    assert session_succeeded_kanban_terminal(rejected) is False
+
+
+def test_terminal_worker_reaps_descendants_to_a_fixed_point(clear_kanban_env, monkeypatch):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+
+    class Child:
+        def __init__(self):
+            self.terminated = False
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.terminated = True
+
+    child = Child()
+
+    class Parent:
+        def children(self, recursive=True):
+            return [] if child.terminated else [child]
+
+    fake = types.SimpleNamespace(
+        Process=lambda pid: Parent(),
+        NoSuchProcess=RuntimeError,
+        AccessDenied=PermissionError,
+        wait_procs=lambda children, timeout: (children, []),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake)
+    assert reap_kanban_worker_descendants(timeout_seconds=0) is True
+    assert child.terminated is True
+
+
+def test_terminal_worker_reports_surviving_descendant(clear_kanban_env, monkeypatch):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+
+    class Child:
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+    child = Child()
+
+    class Parent:
+        def children(self, recursive=True):
+            return [child]
+
+    fake = types.SimpleNamespace(
+        Process=lambda pid: Parent(),
+        NoSuchProcess=RuntimeError,
+        AccessDenied=PermissionError,
+        wait_procs=lambda children, timeout: ([], children),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake)
+    assert reap_kanban_worker_descendants(timeout_seconds=0) is False
+
+
 
 
 
@@ -84,7 +161,5 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
 # without a terminal call, the dispatcher's bounded retry (streak of 3)
 # handles it.  See also tests/hermes_cli/test_kanban_core_functionality.py
 # for the dispatcher-side streak tests.
-
-
 
 

@@ -311,10 +311,10 @@ VALID_HOOKS: Set[str] = {
     #   Privacy: workspace_path is a filesystem path and may reveal project
     #   layout or usernames.
     "on_kanban_worker_spawned",
-    # on_kanban_worker_exited is tick-derived from detect_crashed_workers —
-    # it fires when a dead-PID running task is reclaimed, AFTER every
-    # reclaim/accounting txn has committed. Exit visibility latency is
-    # bounded by the dispatcher tick interval. Adds:
+    # on_kanban_worker_exited is tick-derived. It covers both dead-PID crash
+    # reclaim and the separately certified exit of a logically terminal worker,
+    # AFTER every accounting/certificate transaction has committed. Exit
+    # visibility latency is bounded by the dispatcher tick interval. Adds:
     #   worker_pid: int,
     #   exit_kind: "clean_exit" | "rate_limited" | "nonzero_exit"
     #              | "signaled" | "unknown",

@@ -12,6 +12,9 @@ dispatcher.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -121,6 +124,195 @@ def test_crash_reclaim_fires_worker_exited(kanban_home, captured_hooks, monkeypa
     assert kw["run_id"] is not None
     assert "profile_name" in kw
     assert "board" in kw
+
+
+def test_terminal_run_waits_for_exact_process_exit_then_certifies_once(
+    kanban_home, captured_hooks, monkeypatch,
+):
+    """A logical completion is not an exit; the later OS exit is durable."""
+    conn = kb.connect()
+    try:
+        marker = {
+            "controllerRunId": "controller-241", "eventSequence": 1,
+            "dispatchId": "dispatch-241", "stateUrl": "https://controller/state",
+            "submitUrl": "https://controller/submitLifecycleEvent",
+        }
+        tid = kb.create_task(
+            conn, title="t", assignee="worker", idempotency_key="dispatch-241",
+            body=f"<!-- codex-bmad-lifecycle {json.dumps(marker)} -->",
+        )
+        workspace = kb.workspaces_root() / f"scratch-{tid}"
+        workspace.mkdir(parents=True)
+        conn.execute(
+            "UPDATE tasks SET workspace_kind = 'scratch', workspace_path = ? WHERE id = ?",
+            (str(workspace), tid),
+        )
+        conn.commit()
+        assert kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        monkeypatch.setattr(kb, "_process_started_at", lambda pid: 1_000_123)
+        kb._set_worker_pid(conn, tid, 98766)
+        assert kb.complete_task(
+            conn, tid, summary="done", expected_run_id=run_id,
+        )
+        assert workspace.exists()
+
+        monkeypatch.setattr(kb, "_same_process_instance", lambda pid, started: True)
+        assert kb.certify_terminal_worker_exits(conn) == []
+        pending = kb.get_run(conn, run_id)
+        assert pending.worker_pid == 98766
+        assert pending.process_started_at == 1_000_123
+        assert pending.worker_exited_at is None
+
+        monkeypatch.setattr(kb, "_same_process_instance", lambda pid, started: False)
+        monkeypatch.setattr(kb, "_classify_worker_exit", lambda pid: ("clean_exit", 0))
+        assert kb.certify_terminal_worker_exits(conn) == [tid]
+        assert kb.certify_terminal_worker_exits(conn) == []
+        assert not workspace.exists()
+        deliveries = []
+
+        def transport(url, body):
+            deliveries.append((url, body))
+            return {"expectedEventSequence": 2} if url.endswith("/state") else {"accepted": True}
+
+        assert kb.deliver_worker_exit_certificates(
+            conn, key_id="hermes-lifecycle-v1", secret="lifecycle-secret", transport=transport,
+        ) == [tid]
+        assert kb.deliver_worker_exit_certificates(
+            conn, key_id="hermes-lifecycle-v1", secret="lifecycle-secret", transport=transport,
+        ) == []
+        certified = kb.get_run(conn, run_id)
+    finally:
+        conn.close()
+
+    assert certified.worker_exited_at is not None
+    assert certified.worker_exit_code == 0
+    assert certified.worker_exit_kind == "clean_exit"
+    fired = [
+        event for event in captured_hooks
+        if event[0] == "on_kanban_worker_exited"
+        and event[1].get("task_id") == tid
+        and event[1].get("outcome") == "completed"
+    ]
+    assert len(fired) == 1
+    assert fired[0][1]["run_id"] == run_id
+    assert fired[0][1]["process_started_at"] == 1_000_123
+    assert fired[0][1]["worker_exit_code"] == 0
+    assert fired[0][1]["dispatch_id"] == "dispatch-241"
+    assert len(fired[0][1]["certificate_id"]) == 64
+    assert certified.worker_exit_delivered_at is not None
+    assert certified.worker_exit_delivery_attempts == 1
+    envelope = deliveries[1][1]
+    signature = envelope.pop("signature")
+    expected_signature = hmac.new(
+        b"lifecycle-secret",
+        json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    assert signature == expected_signature
+    assert envelope["permissions"] == ["lifecycle"]
+    assert envelope["payload"]["certificate"]["identity"]["dispatchId"] == "dispatch-241"
+
+
+def test_exit_callback_retries_are_bounded_and_poll_proof_remains(
+    kanban_home, monkeypatch,
+):
+    marker = {
+        "controllerRunId": "controller-241", "eventSequence": 1,
+        "dispatchId": "dispatch-241", "stateUrl": "https://controller/state",
+        "submitUrl": "https://controller/submitLifecycleEvent",
+    }
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="t", assignee="worker", idempotency_key="dispatch-241",
+            body=f"<!-- codex-bmad-lifecycle {json.dumps(marker)} -->",
+        )
+        assert kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        kb._set_worker_pid(conn, tid, 98768)
+        assert kb.complete_task(conn, tid, expected_run_id=run_id)
+        monkeypatch.setattr(kb, "_same_process_instance", lambda pid, started: False)
+        monkeypatch.setattr(kb, "_classify_worker_exit", lambda pid: ("clean_exit", 0))
+        assert kb.certify_terminal_worker_exits(conn) == [tid]
+
+        def unavailable(url, body):
+            raise RuntimeError("callback unavailable")
+
+        for _ in range(kb._WORKER_EXIT_DELIVERY_LIMIT + 2):
+            assert kb.deliver_worker_exit_certificates(
+                conn, key_id="hermes-lifecycle-v1", secret="lifecycle-secret", transport=unavailable,
+            ) == []
+        run = kb.get_run(conn, run_id)
+        events = kb.list_events(conn, tid)
+    finally:
+        conn.close()
+    assert run.worker_exit_delivery_attempts == kb._WORKER_EXIT_DELIVERY_LIMIT
+    assert run.worker_exit_delivered_at is None
+    assert run.worker_exited_at is not None
+    assert any(event.kind == "worker_exit_delivery_abandoned" for event in events)
+
+
+def test_terminal_exit_with_unknown_code_is_not_reported_clean(
+    kanban_home, monkeypatch,
+):
+    """A lost/restarted watcher fails closed instead of inventing rc=0."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="worker")
+        assert kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        kb._set_worker_pid(conn, tid, 98767)
+        assert kb.complete_task(conn, tid, expected_run_id=run_id)
+        monkeypatch.setattr(kb, "_same_process_instance", lambda pid, started: False)
+        monkeypatch.setattr(kb, "_classify_worker_exit", lambda pid: ("unknown", None))
+        assert kb.certify_terminal_worker_exits(conn) == [tid]
+        run = kb.get_run(conn, run_id)
+    finally:
+        conn.close()
+    assert run.worker_exit_code == -1
+    assert run.worker_exit_kind == "unknown"
+
+
+def test_exit_certifier_ignores_crash_retries_and_preserves_blocked_workspace(
+    kanban_home, monkeypatch,
+):
+    """Only terminal handoffs are certified; blocked work remains available."""
+    conn = kb.connect()
+    try:
+        crashed = kb.create_task(conn, title="crash", assignee="worker")
+        assert kb.claim_task(conn, crashed)
+        crash_run = kb.get_task(conn, crashed).current_run_id
+        kb._set_worker_pid(conn, crashed, 98769)
+        conn.execute(
+            "UPDATE task_runs SET ended_at = ?, outcome = 'crashed' WHERE id = ?",
+            (int(time.time()), crash_run),
+        )
+
+        blocked = kb.create_task(conn, title="blocked", assignee="worker")
+        blocked_workspace = kb.workspaces_root() / f"scratch-{blocked}"
+        blocked_workspace.mkdir(parents=True)
+        conn.execute(
+            "UPDATE tasks SET workspace_kind = 'scratch', workspace_path = ? WHERE id = ?",
+            (str(blocked_workspace), blocked),
+        )
+        conn.commit()
+        assert kb.claim_task(conn, blocked)
+        blocked_run = kb.get_task(conn, blocked).current_run_id
+        kb._set_worker_pid(conn, blocked, 98770)
+        assert kb.block_task(
+            conn, blocked, reason="needs review", expected_run_id=blocked_run,
+        )
+
+        monkeypatch.setattr(kb, "_same_process_instance", lambda pid, started: False)
+        monkeypatch.setattr(kb, "_classify_worker_exit", lambda pid: ("clean_exit", 0))
+        assert kb.certify_terminal_worker_exits(conn) == [blocked]
+        assert kb.get_run(conn, crash_run).worker_exited_at is None
+        assert kb.get_run(conn, blocked_run).worker_exited_at is not None
+        assert blocked_workspace.exists()
+    finally:
+        conn.close()
+
 
 def test_stale_claim_reclaim_fires_hook(kanban_home, captured_hooks):
     """A TTL-expired reclaim fires the stale-claim observer post-commit."""

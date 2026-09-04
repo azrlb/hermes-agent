@@ -1839,6 +1839,13 @@ def _cmd_show(args: argparse.Namespace) -> int:
                     "error": r.error,
                     "metadata": r.metadata,
                     "worker_pid": r.worker_pid,
+                    "process_started_at": r.process_started_at,
+                    "worker_exited_at": r.worker_exited_at,
+                    "worker_exit_code": r.worker_exit_code,
+                    "worker_exit_kind": r.worker_exit_kind,
+                    "worker_exit_delivery_attempts": r.worker_exit_delivery_attempts,
+                    "worker_exit_delivered_at": r.worker_exit_delivered_at,
+                    "worker_exit_delivery_error": r.worker_exit_delivery_error,
                     "started_at": r.started_at,
                     "ended_at": r.ended_at,
                 }

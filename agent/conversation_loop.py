@@ -7676,6 +7676,44 @@ def run_conversation(
                     failed = True
                     break
 
+                # A dispatcher-owned kanban worker has no useful work after a
+                # successful terminal board mutation.  Stop before another
+                # model turn can edit files or call tools after its receipt.
+                try:
+                    from agent.kanban_stop import (
+                        kanban_stop_nudge_enabled,
+                        reap_kanban_worker_descendants,
+                        session_succeeded_kanban_terminal,
+                    )
+
+                    _kanban_terminal_succeeded = (
+                        kanban_stop_nudge_enabled()
+                        and session_succeeded_kanban_terminal(messages)
+                    )
+                except Exception:
+                    logger.debug("kanban terminal success check failed", exc_info=True)
+                    _kanban_terminal_succeeded = False
+                if _kanban_terminal_succeeded:
+                    if reap_kanban_worker_descendants():
+                        _turn_exit_reason = "kanban_terminal_succeeded"
+                        final_response = (
+                            getattr(assistant_message, "content", None)
+                            or "Kanban terminal state recorded."
+                        )
+                        logger.info(
+                            "kanban worker exiting immediately after durable terminal tool task=%s",
+                            os.environ.get("HERMES_KANBAN_TASK", ""),
+                        )
+                    else:
+                        _turn_exit_reason = "kanban_descendant_reap_failed"
+                        final_response = "Kanban terminal state recorded, but worker descendants survived cleanup."
+                        failed = True
+                        logger.error(
+                            "kanban worker descendant cleanup failed task=%s",
+                            os.environ.get("HERMES_KANBAN_TASK", ""),
+                        )
+                    break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"
