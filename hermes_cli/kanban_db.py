@@ -7240,6 +7240,75 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def _transition_worker_stop_verified(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Check current ownership again inside the state-changing transaction."""
+    task = conn.execute("SELECT claim_lock, current_run_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+    run = conn.execute(
+        "SELECT * FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if task is None:
+        return False
+    if run is None:
+        return task["claim_lock"] is None
+    if task["current_run_id"] is not None and task["current_run_id"] != run["id"]:
+        return False
+    if not run["worker_job_name"]:
+        return not run["worker_pid"] and task["claim_lock"] is None
+    from hermes_cli.kanban_worker_job import job_is_empty
+    return job_is_empty(run["worker_job_name"], bool(run["worker_job_attached"]),
+                        bool(run["worker_job_drained"]))
+
+
+def prepare_worker_stop_for_transition(
+    conn: sqlite3.Connection, task_id: str, *, reason: str,
+) -> bool:
+    """Durably request and verify a Windows stop without releasing ownership.
+
+    Call before opening a product/status transaction. That transaction must
+    check proof again, since a different attempt may have claimed meanwhile.
+    """
+    if conn.in_transaction:
+        raise RuntimeError("worker stop preparation requires its own durable transaction")
+    if _transition_worker_stop_verified(conn, task_id):
+        return True
+    with write_txn(conn):
+        task = conn.execute("SELECT current_run_id, claim_lock FROM tasks WHERE id=?", (task_id,)).fetchone()
+        run = conn.execute(
+            "SELECT * FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        if task is None or run is None or not run["worker_job_attached"] or not run["worker_job_name"]:
+            return False
+        _append_event(conn, task_id, "worker_stop_requested",
+                      {"reason": reason, "worker_job_name": run["worker_job_name"]}, run_id=run["id"])
+    from hermes_cli.kanban_worker_job import terminate_job
+    if not terminate_job(run["worker_job_name"], True):
+        return False
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET worker_job_drained=1, worker_job_exit_code=1 WHERE id=? "
+            "AND worker_job_name=?",
+            (run["id"], run["worker_job_name"]),
+        )
+        _append_event(conn, task_id, "worker_stop_verified",
+                      {"reason": reason, "worker_job_name": run["worker_job_name"], "exit_code": 1},
+                      run_id=run["id"])
+    return _transition_worker_stop_verified(conn, task_id)
+
+
+def prepare_descendant_stops_for_parent_reopen(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Leave all descendant claims intact until every required stop is proved."""
+    rows = conn.execute(
+        "WITH RECURSIVE descendants(id) AS ("
+        "SELECT child_id FROM task_links WHERE parent_id=? UNION "
+        "SELECT l.child_id FROM task_links l JOIN descendants d ON d.id=l.parent_id) "
+        "SELECT t.id FROM tasks t JOIN descendants d ON d.id=t.id "
+        "WHERE t.status IN ('ready','review','running','done') ORDER BY t.id",
+        (task_id,),
+    ).fetchall()
+    return all(prepare_worker_stop_for_transition(conn, row["id"], reason=f"ancestor {task_id} reopened")
+               for row in rows)
+
+
 def invalidate_descendants_for_parent_reopen(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7276,7 +7345,12 @@ def invalidate_descendants_for_parent_reopen(
     * a ``task_comments`` row naming the reopened ancestor, so operators see
       WHY a card moved instead of watching it silently teleport.
 
-    Live ``running`` descendants keep the termination behavior (a running
+    On Windows, a separate durable stop request and verified process-group
+    drain precede this transaction; ownership stays intact until then. A
+    nested caller must prepare stops before opening its outer transaction.
+    This transaction checks proof again and rolls back if ownership changed.
+
+    On other platforms, live ``running`` descendants keep the termination behavior (a running
     child building on a retracted premise is wasted spend): their run is
     closed ``reclaimed`` and their worker is killed via
     :func:`_terminate_reclaimed_worker` — the same helper the reclaim paths
@@ -7302,6 +7376,9 @@ def invalidate_descendants_for_parent_reopen(
     and each termination is a ``(worker_pid, claim_lock)`` tuple.
     """
     caller_owns_txn = bool(getattr(conn, "in_transaction", False))
+    if _IS_WINDOWS and not caller_owns_txn:
+        if not prepare_descendant_stops_for_parent_reopen(conn, task_id):
+            raise RuntimeError("descendant process-group stop is unverified; ownership retained")
     now = int(time.time())
     invalidated: list[dict[str, Any]] = []
     terminations: list[tuple[Optional[int], Optional[str]]] = []
@@ -7326,6 +7403,8 @@ def invalidate_descendants_for_parent_reopen(
             previous_status = row["status"]
             if previous_status not in {"ready", "review", "running", "done"}:
                 continue
+            if _IS_WINDOWS and not _transition_worker_stop_verified(conn, row["id"]):
+                raise RuntimeError("descendant ownership changed or stop is unverified; transition rolled back")
             resume_status = "ready"
             run_id = None
             if previous_status == "review":
@@ -7334,7 +7413,8 @@ def invalidate_descendants_for_parent_reopen(
                 resume_status = _retry_status_for_run(
                     conn, row["id"], row["current_run_id"]
                 )
-                terminations.append((row["worker_pid"], row["claim_lock"]))
+                if not _IS_WINDOWS:
+                    terminations.append((row["worker_pid"], row["claim_lock"]))
                 run_id = _end_run(
                     conn,
                     row["id"],

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 from pathlib import Path
 import subprocess
@@ -14,10 +15,20 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+def _dashboard_status_writer(root):
+    spec = importlib.util.spec_from_file_location(
+        "my244_windows_dashboard", root / "plugins/kanban/dashboard/plugin_api.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module._set_status_direct
+
+
 @pytest.mark.windows_only
 @pytest.mark.parametrize("cooperative", [True, False], ids=["reaped-child", "orphan-child"])
-@pytest.mark.parametrize("mode", ["contained", "legacy-uncontained", "legacy-stop", "supervisor-crash", "controller-stop", "controller-stop-running", "manual-reclaim", "ttl-reclaim", "heartbeat-reclaim", "runtime-reclaim", "legacy-reclaim", "crash-reclaim", "legacy-crash-reclaim", "capacity-crash-reclaim"])
-def test_terminal_certificate_requires_the_complete_process_tree(cooperative, mode):
+@pytest.mark.parametrize("mode", ["contained", "legacy-uncontained", "legacy-stop", "supervisor-crash", "controller-stop", "controller-stop-running", "manual-reclaim", "ttl-reclaim", "heartbeat-reclaim", "runtime-reclaim", "legacy-reclaim", "crash-reclaim", "legacy-crash-reclaim", "capacity-crash-reclaim", "parent-reclaim", "parent-done-reclaim", "legacy-parent-reclaim", "parent-restart-reclaim", "parent-failed-reclaim", "dashboard-parent-reclaim", "dashboard-reclaim"])
+def test_terminal_certificate_requires_the_complete_process_tree(cooperative, mode, monkeypatch):
     """A clean parent exit cannot certify a child that remains alive."""
     root = Path(__file__).resolve().parents[2]
     contained = not mode.startswith("legacy")
@@ -40,7 +51,12 @@ sys.exit(int(sys.argv[2]))
     worker = None
     child = None
     try:
-        tid = kb.create_task(conn, title="MY-243 disposable Windows probe", assignee="probe")
+        parent = None
+        if "parent" in mode:
+            parent = kb.create_task(conn, title="disposable ancestor", assignee="probe")
+            assert kb.complete_task(conn, parent)
+        tid = kb.create_task(conn, title="MY-243 disposable Windows probe", assignee="probe",
+                             parents=[parent] if parent else [])
         assert kb.claim_task(conn, tid)
         run_id = kb.get_task(conn, tid).current_run_id
         env = dict(os.environ, HERMES_KANBAN_TASK=tid, HERMES_KANBAN_STOP_NUDGE="1")
@@ -60,9 +76,57 @@ sys.exit(int(sys.argv[2]))
         assert child.is_running()
         kb._set_worker_pid(conn, tid, actual_pid)
         reclaiming = mode.endswith("reclaim")
-        if mode != "controller-stop-running" and not reclaiming:
+        if mode == "parent-done-reclaim" or (mode != "controller-stop-running" and not reclaiming):
             assert kb.complete_task(conn, tid, expected_run_id=run_id)
         assert kb.certify_terminal_worker_exits(conn) == []
+        if parent:
+            if mode.startswith("legacy"):
+                with pytest.raises(RuntimeError, match="unverified"):
+                    kb.invalidate_descendants_for_parent_reopen(conn, parent, author="test")
+                assert kb.get_task(conn, tid).claim_lock is not None
+                assert child.is_running()
+                return
+            if mode == "parent-failed-reclaim":
+                from hermes_cli import kanban_worker_job
+                with monkeypatch.context() as failure:
+                    failure.setattr(kanban_worker_job, "terminate_job", lambda *_args: False)
+                    with pytest.raises(RuntimeError, match="unverified"):
+                        kb.invalidate_descendants_for_parent_reopen(conn, parent, author="test")
+                assert kb.get_task(conn, tid).claim_lock is not None
+                assert child.is_running()
+                assert "descendant_invalidated" not in [e.kind for e in kb.list_events(conn, tid)]
+            if mode == "parent-restart-reclaim":
+                assert kb.prepare_descendant_stops_for_parent_reopen(conn, parent)
+                conn.close()
+                conn = kb.connect()
+                assert kb.get_task(conn, tid).claim_lock is not None
+                assert kb.get_task(conn, tid).status == "running"
+            if mode == "dashboard-parent-reclaim":
+                assert _dashboard_status_writer(root)(conn, parent, "todo")
+                assert kb.get_task(conn, parent).status == "todo"
+            else:
+                result = kb.invalidate_descendants_for_parent_reopen(conn, parent, author="test")
+                assert result["invalidated"][0]["id"] == tid
+                assert result["terminations"] == []
+            child.wait(timeout=5)
+            worker.communicate(timeout=15)
+            assert not child.is_running()
+            assert kb.get_task(conn, tid).status == "todo"
+            conn.close()
+            conn = kb.connect()
+            kinds = [event.kind for event in kb.list_events(conn, tid)]
+            assert kinds.index("worker_stop_requested") < kinds.index("worker_stop_verified")
+            assert kinds.index("worker_stop_verified") < kinds.index("descendant_invalidated")
+            assert conn.execute("SELECT worker_job_exit_code FROM task_runs WHERE id=?", (run_id,)).fetchone()[0] == 1
+            return
+        if mode == "dashboard-reclaim":
+            assert _dashboard_status_writer(root)(conn, tid, "ready")
+            child.wait(timeout=5)
+            worker.communicate(timeout=15)
+            assert not child.is_running()
+            assert kb.get_task(conn, tid).status == "ready"
+            assert kb.get_task(conn, tid).claim_lock is None
+            return
         if mode in ("crash-reclaim", "legacy-crash-reclaim", "capacity-crash-reclaim"):
             with kb.write_txn(conn):
                 conn.execute("UPDATE tasks SET started_at=1 WHERE id=?", (tid,))

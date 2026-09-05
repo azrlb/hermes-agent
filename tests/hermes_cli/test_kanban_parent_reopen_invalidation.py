@@ -116,6 +116,26 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
         return {"terminated": True}
 
     monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
+    if kb._IS_WINDOWS:
+        from hermes_cli import kanban_worker_job
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_runs SET worker_job_name='test-job', worker_job_attached=1 WHERE id=?",
+                         (claimed.current_run_id,))
+        monkeypatch.setattr(kanban_worker_job, "job_is_empty", lambda _name, _attached, drained: drained)
+
+        def fake_job_stop(name, attached):
+            side = kb.connect(tmp_path / "kanban.db")
+            try:
+                kinds = [e.kind for e in kb.list_events(side, child_id)]
+                assert "worker_stop_requested" in kinds
+                assert "descendant_invalidated" not in kinds
+                assert kb.get_task(side, child_id).claim_lock == claimed.claim_lock
+            finally:
+                side.close()
+            kills.append((424242, claimed.claim_lock))
+            return True
+
+        monkeypatch.setattr(kanban_worker_job, "terminate_job", fake_job_stop)
 
     _reopen_parent_directly(conn, parent_id)
     result = kb.invalidate_descendants_for_parent_reopen(
@@ -123,13 +143,37 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     )
 
     assert kills and kills[0][0] == 424242
-    assert result["terminations"] == kills
+    assert result["terminations"] == ([] if kb._IS_WINDOWS else kills)
     child = kb.get_task(conn, child_id)
     assert child is not None
     assert child.status == "todo"
     assert child.current_run_id is None
     run = kb.latest_run(conn, child_id)
     assert run is not None and run.outcome == "reclaimed"
+
+
+@pytest.mark.windows_only
+def test_new_attempt_after_stop_preparation_rolls_back_parent_reopen(conn):
+    parent = kb.create_task(conn, title="ancestor", assignee="planner")
+    assert kb.complete_task(conn, parent)
+    child = kb.create_task(conn, title="child", assignee="builder", parents=[parent])
+    old = kb.claim_task(conn, child)
+    # Model the boundary after a proven stop and before a separate writer
+    # takes a new claim. Old evidence must not authorize the new attempt.
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_runs SET worker_job_name='old-job', worker_job_attached=1, "
+                     "worker_job_drained=1, worker_job_exit_code=1 WHERE id=?", (old.current_run_id,))
+        conn.execute("UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+                     "claim_expires=NULL WHERE id=?", (child,))
+    new = kb.claim_task(conn, child)
+    assert new.current_run_id != old.current_run_id
+    with pytest.raises(RuntimeError, match="ownership changed or stop is unverified"):
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (parent,))
+            kb.invalidate_descendants_for_parent_reopen(conn, parent, author="test")
+    assert kb.get_task(conn, parent).status == "done"
+    assert kb.get_task(conn, child).current_run_id == new.current_run_id
+    assert kb.get_task(conn, child).claim_lock == new.claim_lock
 
 
 def test_counter_reset_on_invalidated_descendants(conn):
@@ -228,3 +272,21 @@ def test_dashboard_and_db_paths_produce_identical_outcomes(tmp_path, monkeypatch
         assert failures == 0
         assert "descendant_invalidated" in kinds
         assert n_comments >= 1
+
+    # This is retry routing, not a native stop test: explicitly supply proof.
+    monkeypatch.setattr(kb, "prepare_worker_stop_for_transition", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(kb, "_transition_worker_stop_verified", lambda *_args: True)
+    with kb.connect() as c:
+        parent = kb.create_task(c, title="review ancestor", assignee="planner")
+        assert kb.complete_task(c, parent)
+        review = kb.create_task(c, title="review retry", assignee="reviewer",
+                                parents=[parent])
+        implementation = kb.claim_task(c, review)
+        assert implementation
+        assert kb.request_review(c, review, summary="ready for review", reviewer="reviewer",
+                                 expected_run_id=implementation.current_run_id)
+        assert kb.claim_review_task(c, review)
+        with kb.write_txn(c):
+            c.execute("UPDATE tasks SET status='todo' WHERE id=?", (parent,))
+        assert mod._set_status_direct(c, review, "ready")
+        assert kb.get_task(c, review).status == "todo"

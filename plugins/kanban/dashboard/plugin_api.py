@@ -1109,8 +1109,8 @@ def _invalidate_descendants_for_parent_reopen(
     :func:`kanban_db.invalidate_descendants_for_parent_reopen` so every
     reopen surface shares one implementation. We run inside the caller's
     open transaction, so the domain function composes via a savepoint and
-    returns the worker terminations for us to perform post-commit (events
-    must be durable BEFORE the kill).
+    returns post-commit terminations on other platforms. On Windows, stops
+    are prepared durably before the outer transaction and rechecked inside.
     """
     result = kanban_db.invalidate_descendants_for_parent_reopen(
         conn, parent_id, author="dashboard",
@@ -1133,6 +1133,29 @@ def _set_status_direct(
     """
     terminations: list[tuple[Optional[int], Optional[str]]] = []
     effective_status = new_status
+    if kanban_db._IS_WINDOWS:
+        before = conn.execute("SELECT status, current_run_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if before is None:
+            return False
+        resumes_review = (
+            before["status"] == "running" and new_status == "ready"
+            and kanban_db._retry_status_for_run(conn, task_id, before["current_run_id"]) == "review"
+        )
+        if new_status == "ready" and not resumes_review:
+            unmet = conn.execute(
+                "SELECT 1 FROM tasks p JOIN task_links l ON l.parent_id=p.id "
+                "WHERE l.child_id=? AND p.status NOT IN ('done','archived') LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if unmet:
+                return False
+        if new_status != "running" and not kanban_db.prepare_worker_stop_for_transition(
+            conn, task_id, reason=f"dashboard transition to {new_status}",
+        ):
+            return False
+        if before["status"] in {"done", "archived"} and new_status not in {"done", "archived"}:
+            if not kanban_db.prepare_descendant_stops_for_parent_reopen(conn, task_id):
+                return False
     with kanban_db.write_txn(conn):
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
@@ -1142,6 +1165,9 @@ def _set_status_direct(
         ).fetchone()
         if prev is None:
             return False
+        if kanban_db._IS_WINDOWS and new_status != "running":
+            if not kanban_db._transition_worker_stop_verified(conn, task_id):
+                return False
 
         if prev["status"] == "running" and new_status == "ready":
             resume_status = kanban_db._retry_status_for_run(
@@ -1198,7 +1224,8 @@ def _set_status_direct(
                 outcome="reclaimed", status="reclaimed",
                 summary=f"status changed to {effective_status} (dashboard/direct)",
             )
-            terminations.append((prev["worker_pid"], prev["claim_lock"]))
+            if not kanban_db._IS_WINDOWS:
+                terminations.append((prev["worker_pid"], prev["claim_lock"]))
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, ?, 'status', ?, ?)",
