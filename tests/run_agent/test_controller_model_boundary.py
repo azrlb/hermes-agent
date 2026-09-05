@@ -20,7 +20,7 @@ def test_controlled_model_writes_real_worker_evidence(tmp_path, monkeypatch):
     _run_controlled_model(tmp_path, monkeypatch)
 
 
-def _run_controlled_model(tmp_path, monkeypatch, *, kanban_worker=False):
+def _run_controlled_model(tmp_path, monkeypatch, *, kanban_worker=False, cli_completion=False):
     original_connect = socket.socket.connect
 
     def refuse_network(sock, address):
@@ -58,7 +58,10 @@ def _run_controlled_model(tmp_path, monkeypatch, *, kanban_worker=False):
                 name, args = "terminal", {"command": 'git -c user.name="Worker Test" -c user.email=test@example.invalid commit -qm "worker evidence"'}
             else:
                 assert subprocess.check_output(['git', '-C', str(tmp_path), 'show', 'HEAD:worker-evidence.md'], text=True) == 'verified fixture output\n'
-                name, args = "kanban_complete", {"summary": "Evidence saved in Git."}
+                if cli_completion:
+                    name, args = "terminal", {"command": f'"{sys.executable}" -m hermes_cli.main kanban --board probe complete {os.environ["HERMES_KANBAN_TASK"]} --summary "Evidence saved in Git."'}
+                else:
+                    name, args = "kanban_complete", {"summary": "Evidence saved in Git."}
             tools = [SimpleNamespace(id=f"worker-step-{len(calls)}", type="function", function=SimpleNamespace(name=name, arguments=json.dumps(args)))]
             content = None
         else:
@@ -82,7 +85,8 @@ def _run_controlled_model(tmp_path, monkeypatch, *, kanban_worker=False):
 
 
 @pytest.mark.windows_only
-def test_supervised_agent_saves_git_output_and_fresh_observer_certifies_exit(tmp_path):
+@pytest.mark.parametrize("cli_completion", [False, True], ids=["model-tool", "receipt-cli-path"])
+def test_supervised_agent_saves_git_output_and_fresh_observer_certifies_exit(tmp_path, cli_completion):
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_worker_job import prepare_worker_command
 
@@ -103,12 +107,12 @@ from pathlib import Path
 import pytest
 from hermes_cli import kanban_db as kb
 with pytest.MonkeyPatch.context() as isolated:
-    runpy.run_path(sys.argv[1])['_run_controlled_model'](Path(sys.argv[2]), isolated, kanban_worker=True)
+    runpy.run_path(sys.argv[1])['_run_controlled_model'](Path(sys.argv[2]), isolated, kanban_worker=True, cli_completion=sys.argv[3] == 'True')
 print('WORKER_ASSERTIONS_PASSED', flush=True)
 kb.write_kanban_worker_exit_record(0)
 """
         command = prepare_worker_command(conn, tid, run_id,
-                                         [sys.executable, "-u", "-c", code, str(Path(__file__).resolve()), str(workspace)])
+                                         [sys.executable, "-u", "-c", code, str(Path(__file__).resolve()), str(workspace), str(cli_completion)])
         worker = subprocess.Popen(command, cwd=root, env=environment, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
         kb._set_worker_pid(conn, tid, worker.pid)

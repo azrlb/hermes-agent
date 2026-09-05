@@ -13,7 +13,36 @@ from agent.kanban_stop import (
     reap_kanban_worker_descendants,
     session_called_kanban_terminal,
     session_succeeded_kanban_terminal,
+    worker_attempt_is_terminal,
 )
+
+
+@pytest.mark.parametrize("case", ["completed", "running", "wrong-run", "wrong-task", "reopened", "malformed", "missing"])
+def test_cli_completion_requires_exact_terminal_attempt(monkeypatch, case):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "probe")
+    with kb.connect_closing(board="probe") as conn:
+        tid = kb.create_task(conn, title="CLI completion ownership", assignee="probe")
+        run_id = kb.claim_task(conn, tid).current_run_id
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+        assert not worker_attempt_is_terminal()
+        if case != "running":
+            assert kb.complete_task(conn, tid, expected_run_id=run_id)
+        if case == "wrong-run":
+            monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id + 1))
+        elif case == "wrong-task":
+            monkeypatch.setenv("HERMES_KANBAN_TASK", "t_not_this_worker")
+        elif case == "reopened":
+            # Exercise a reopened task without inventing another completion.
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+            assert kb.claim_task(conn, tid).current_run_id != run_id
+        elif case == "malformed":
+            monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "not-a-run")
+        elif case == "missing":
+            monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+        assert worker_attempt_is_terminal() is (case == "completed")
 
 
 @pytest.fixture
@@ -161,5 +190,4 @@ def test_terminal_worker_reports_surviving_descendant(clear_kanban_env, monkeypa
 # without a terminal call, the dispatcher's bounded retry (streak of 3)
 # handles it.  See also tests/hermes_cli/test_kanban_core_functionality.py
 # for the dispatcher-side streak tests.
-
 

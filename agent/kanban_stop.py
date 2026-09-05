@@ -85,6 +85,37 @@ def session_succeeded_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     return False
 
 
+def worker_attempt_is_terminal() -> bool:
+    """Recognize completion by a child CLI without trusting its stdout.
+
+    The task alone is insufficient: a previous attempt or a reopened task must
+    never authorize this worker's successful exit. Read the exact inherited
+    attempt and latest task state together from one database snapshot.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+    if not task_id or not run_id.isdecimal() or int(run_id) < 1:
+        return False
+    try:
+        from hermes_cli import kanban_db as kb
+
+        with kb.connect_closing() as conn:
+            row = conn.execute(
+                "SELECT t.status AS task_status, r.outcome AS outcome "
+                "FROM tasks t JOIN task_runs r ON r.task_id = t.id "
+                "WHERE t.id = ? AND r.id = ? AND r.ended_at IS NOT NULL "
+                "AND t.current_run_id IS NULL "
+                "AND r.id = (SELECT MAX(id) FROM task_runs WHERE task_id = t.id)",
+                (task_id, int(run_id)),
+            ).fetchone()
+        return row is not None and (row["task_status"], row["outcome"]) in {
+            ("done", "completed"), ("blocked", "blocked"),
+        }
+    except Exception:
+        # Missing, unreadable or conflicting state is never completion proof.
+        return False
+
+
 def reap_kanban_worker_descendants(timeout_seconds: float = 3.0) -> bool:
     """Stop every descendant before a terminal kanban worker exits.
 

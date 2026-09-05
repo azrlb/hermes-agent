@@ -7684,11 +7684,13 @@ def run_conversation(
                         kanban_stop_nudge_enabled,
                         reap_kanban_worker_descendants,
                         session_succeeded_kanban_terminal,
+                        worker_attempt_is_terminal,
                     )
 
                     _kanban_terminal_succeeded = (
                         kanban_stop_nudge_enabled()
-                        and session_succeeded_kanban_terminal(messages)
+                        and (session_succeeded_kanban_terminal(messages)
+                             or worker_attempt_is_terminal())
                     )
                 except Exception:
                     logger.debug("kanban terminal success check failed", exc_info=True)
