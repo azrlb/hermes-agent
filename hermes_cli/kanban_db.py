@@ -9553,7 +9553,9 @@ def detect_crashed_workers(
     with write_txn(conn):
         rows = conn.execute(
             "SELECT t.assignee, t.id, t.worker_pid, t.claim_lock, t.started_at, "
-            "t.current_run_id, r.started_at AS run_started_at FROM tasks t "
+            "t.current_run_id, r.started_at AS run_started_at, "
+            "r.worker_job_name, r.worker_job_attached, r.worker_job_drained, "
+            "r.worker_job_exit_code FROM tasks t "
             "LEFT JOIN task_runs r ON r.id = t.current_run_id "
             "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
         ).fetchall()
@@ -9574,6 +9576,16 @@ def detect_crashed_workers(
             if _pid_alive(row["worker_pid"]):
                 continue
 
+            if _IS_WINDOWS:
+                from hermes_cli.kanban_worker_job import job_is_empty
+                if not job_is_empty(
+                    row["worker_job_name"], bool(row["worker_job_attached"]),
+                    bool(row["worker_job_drained"]),
+                ):
+                    # Parent death can leave descendants alive. Do not free
+                    # ownership or consume exit records without group proof.
+                    continue
+
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             if kind == "unknown":
@@ -9587,6 +9599,13 @@ def detect_crashed_workers(
                             row["id"], int(row["current_run_id"]), board=board,
                         )
                     )
+            if kind == "unknown" and _IS_WINDOWS and row["worker_job_exit_code"] is not None:
+                # The supervisor saved this exact attempt's result after its
+                # descendants drained. Retain capacity classification even
+                # when a restarted observer has no in-memory process handle.
+                code = int(row["worker_job_exit_code"])
+                kind = ("clean_exit" if code == 0 else "capacity_wait"
+                        if code == KANBAN_CAPACITY_WAIT_EXIT_CODE else "nonzero_exit")
             capacity_wait_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still

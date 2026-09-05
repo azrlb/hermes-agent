@@ -460,6 +460,7 @@ def test_review_dependency_wait_reenters_review_after_parent_finishes(conn) -> N
     assert resumed.status == "review"
 
 
+@pytest.mark.usefixtures("simulated_empty_worker_group")
 def test_crashed_and_timed_out_review_runs_retry_in_review_phase(
     conn,
     monkeypatch: pytest.MonkeyPatch,

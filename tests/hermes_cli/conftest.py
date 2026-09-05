@@ -6,6 +6,17 @@ import pytest
 
 
 @pytest.fixture
+def simulated_empty_worker_group(monkeypatch):
+    """Explicit process-proof seam for tests of retry policy, not OS safety.
+
+    Opt in only for synthetic worker IDs. Real Windows containment and legacy
+    refusal tests must never request this fixture.
+    """
+    from hermes_cli import kanban_worker_job
+    monkeypatch.setattr(kanban_worker_job, "job_is_empty", lambda *_args: True)
+
+
+@pytest.fixture
 def all_assignees_spawnable(monkeypatch):
     """Pretend every assignee maps to a real Hermes profile.
 

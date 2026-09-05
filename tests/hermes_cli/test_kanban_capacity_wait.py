@@ -94,6 +94,7 @@ def test_durable_exit_record_survives_gateway_memory_loss(
     )
 
 
+@pytest.mark.usefixtures("simulated_empty_worker_group")
 def test_detect_crashed_worker_neutrally_requeues_from_durable_record(
     kanban_home, monkeypatch,
 ):
@@ -176,6 +177,7 @@ def test_capacity_wait_cooldown_defers_then_allows_probe(
         assert kb.check_respawn_guard(conn, task_id) is None
 
 
+@pytest.mark.usefixtures("simulated_empty_worker_group")
 def test_mismatched_durable_record_is_counted_as_a_real_crash(
     kanban_home, monkeypatch,
 ):
@@ -273,6 +275,7 @@ def test_dispatcher_supplies_exact_durable_exit_record_path(
             kb._worker_processes.pop(FakePopen.pid, None)
 
 
+@pytest.mark.usefixtures("simulated_empty_worker_group")
 def test_non_default_board_restart_classifies_before_expired_claim_reclaim(
     kanban_home, monkeypatch,
 ):

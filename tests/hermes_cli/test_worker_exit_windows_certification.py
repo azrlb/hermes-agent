@@ -16,7 +16,7 @@ from hermes_cli import kanban_db as kb
 
 @pytest.mark.windows_only
 @pytest.mark.parametrize("cooperative", [True, False], ids=["reaped-child", "orphan-child"])
-@pytest.mark.parametrize("mode", ["contained", "legacy-uncontained", "legacy-stop", "supervisor-crash", "controller-stop", "controller-stop-running", "manual-reclaim", "ttl-reclaim", "heartbeat-reclaim", "runtime-reclaim", "legacy-reclaim"])
+@pytest.mark.parametrize("mode", ["contained", "legacy-uncontained", "legacy-stop", "supervisor-crash", "controller-stop", "controller-stop-running", "manual-reclaim", "ttl-reclaim", "heartbeat-reclaim", "runtime-reclaim", "legacy-reclaim", "crash-reclaim", "legacy-crash-reclaim", "capacity-crash-reclaim"])
 def test_terminal_certificate_requires_the_complete_process_tree(cooperative, mode):
     """A clean parent exit cannot certify a child that remains alive."""
     root = Path(__file__).resolve().parents[2]
@@ -32,7 +32,8 @@ child = subprocess.Popen(
 print(json.dumps({'worker': os.getpid(), 'supervisor': os.getppid(), 'child': child.pid}), flush=True)
 sys.stdin.readline()
 if sys.argv[1] == 'reap':
-    sys.exit(0 if reap_kanban_worker_descendants(0.2) else 17)
+    sys.exit(int(sys.argv[2]) if reap_kanban_worker_descendants(0.2) else 17)
+sys.exit(int(sys.argv[2]))
 """
     kb.init_db()
     conn = kb.connect()
@@ -43,7 +44,8 @@ if sys.argv[1] == 'reap':
         assert kb.claim_task(conn, tid)
         run_id = kb.get_task(conn, tid).current_run_id
         env = dict(os.environ, HERMES_KANBAN_TASK=tid, HERMES_KANBAN_STOP_NUDGE="1")
-        command = [sys.executable, "-u", "-c", code, "reap" if cooperative else "orphan"]
+        command = [sys.executable, "-u", "-c", code, "reap" if cooperative else "orphan",
+                   "75" if mode == "capacity-crash-reclaim" else "0"]
         if contained:
             from hermes_cli.kanban_worker_job import prepare_worker_command
             command = prepare_worker_command(conn, tid, run_id, command)
@@ -61,6 +63,40 @@ if sys.argv[1] == 'reap':
         if mode != "controller-stop-running" and not reclaiming:
             assert kb.complete_task(conn, tid, expected_run_id=run_id)
         assert kb.certify_terminal_worker_exits(conn) == []
+        if mode in ("crash-reclaim", "legacy-crash-reclaim", "capacity-crash-reclaim"):
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET started_at=1 WHERE id=?", (tid,))
+            worker.stdin.write("exit\n")
+            worker.stdin.flush()
+            if contained and not cooperative:
+                psutil.Process(identity["worker"]).wait(timeout=5)
+                assert child.is_running()
+                assert kb.detect_crashed_workers(conn) == []
+                assert kb.get_task(conn, tid).claim_lock is not None
+                child.kill()
+                child.wait(timeout=5)
+            worker.communicate(timeout=15)
+            kb._record_worker_exit_code(actual_pid, worker.returncode)
+            if mode == "capacity-crash-reclaim":
+                kb._recent_worker_exits.clear()
+                conn.close()
+                conn = kb.connect()
+            recovered = kb.detect_crashed_workers(conn)
+            if mode == "capacity-crash-reclaim":
+                assert recovered == []
+                assert tid in kb.detect_crashed_workers._last_capacity_wait
+                assert kb.get_task(conn, tid).claim_lock is None
+                assert kb.get_task(conn, tid).consecutive_failures == 0
+                assert kb.get_run(conn, run_id).outcome == "capacity_wait"
+            elif contained:
+                assert tid in recovered
+                assert kb.get_task(conn, tid).claim_lock is None
+            else:
+                assert recovered == []
+                assert kb.get_task(conn, tid).claim_lock is not None
+                if not cooperative:
+                    assert child.is_running()
+            return
         if reclaiming:
             if mode == "ttl-reclaim":
                 with kb.write_txn(conn):

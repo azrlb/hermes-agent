@@ -264,6 +264,7 @@ def _exited_status(code: int) -> int:
 
 
 
+@pytest.mark.usefixtures("simulated_empty_worker_group")
 def test_rate_limit_exit_requeues_without_counting_failure(
     kanban_home, monkeypatch,
 ):

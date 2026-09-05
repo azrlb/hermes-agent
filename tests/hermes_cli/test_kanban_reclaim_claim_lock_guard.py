@@ -108,6 +108,12 @@ def test_genuine_crash_still_reclaims(conn):
     kb._record_worker_exit(dead.pid, 1 << 8)  # nonzero exit → crash
 
     crashed = kb.detect_crashed_workers(conn)
+    if kb._IS_WINDOWS:
+        # This old launcher creates no containment job. Parent exit alone is
+        # deliberately insufficient; real contained success has its own test.
+        assert crashed == []
+        assert kb.get_task(conn, tid).claim_lock is not None
+        return
     assert tid in crashed
     final = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
     assert final["status"] in ("ready", "blocked", "todo")

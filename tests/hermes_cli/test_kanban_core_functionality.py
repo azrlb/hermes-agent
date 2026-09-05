@@ -402,6 +402,7 @@ def test_migration_renames_legacy_event_kinds(tmp_path, monkeypatch):
 
 
 
+@pytest.mark.usefixtures("simulated_empty_worker_group")
 def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatch):
     """Stale retry attempts cannot mutate the active run lifecycle."""
     import hermes_cli.kanban_db as _kb
@@ -1413,6 +1414,7 @@ def _drive_nonzero_crash(conn, tid, fake_pid):
     return _drive_worker_exit(conn, tid, fake_pid, 256)
 
 
+@pytest.mark.usefixtures("simulated_empty_worker_group")
 def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
     """Mixed failure kinds must not consume the violation retry budget.
 

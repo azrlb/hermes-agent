@@ -120,6 +120,7 @@ def test_dispatch_spawn_fires_worker_spawned(
     assert "board" in kw
     assert pid_at_fire_time == [4242]
 
+@pytest.mark.usefixtures("simulated_empty_worker_group")
 def test_crash_reclaim_fires_worker_exited(kanban_home, captured_hooks, monkeypatch):
     """A dead-PID reclaim fires the exit observer with the exit facts."""
     conn = kb.connect()
@@ -346,7 +347,7 @@ def test_stale_claim_reclaim_fires_hook(kanban_home, captured_hooks):
             (int(time.time()) - 100, tid),
         )
         conn.commit()
-        assert kb.release_stale_claims(conn) == 1
+        assert kb.release_stale_claims(conn, signal_fn=lambda *_: None) == 1
     finally:
         conn.close()
 
@@ -362,6 +363,7 @@ def test_stale_claim_reclaim_fires_hook(kanban_home, captured_hooks):
     assert "profile_name" in kw
     assert "board" in kw
 
+@pytest.mark.usefixtures("simulated_empty_worker_group")
 def test_raising_callbacks_never_break_worker_lifecycle(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
@@ -391,7 +393,7 @@ def test_raising_callbacks_never_break_worker_lifecycle(
                 (int(time.time()) - 100, tid),
             )
             conn.commit()
-            assert kb.release_stale_claims(conn) == 1
+            assert kb.release_stale_claims(conn, signal_fn=lambda *_: None) == 1
         finally:
             conn.close()
     finally:
