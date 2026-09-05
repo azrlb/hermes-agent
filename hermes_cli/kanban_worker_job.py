@@ -26,6 +26,9 @@ def _kernel():
         ("OpenJobObjectW", [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR], wintypes.HANDLE),
         ("GetCurrentProcess", [], wintypes.HANDLE),
         ("AssignProcessToJobObject", [wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+        ("TerminateJobObject", [wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+        ("SetInformationJobObject", [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                     wintypes.DWORD], wintypes.BOOL),
         ("QueryInformationJobObject", [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
                                        wintypes.DWORD, ctypes.c_void_p], wintypes.BOOL),
         ("CloseHandle", [wintypes.HANDLE], wintypes.BOOL),
@@ -45,6 +48,31 @@ class _Accounting(ctypes.Structure):
     ]
 
 
+class _BasicLimits(ctypes.Structure):
+    _fields_ = [
+        ("process_time", ctypes.c_longlong), ("job_time", ctypes.c_longlong),
+        ("flags", wintypes.DWORD), ("minimum_working_set", ctypes.c_size_t),
+        ("maximum_working_set", ctypes.c_size_t), ("active_process_limit", wintypes.DWORD),
+        ("affinity", ctypes.c_size_t), ("priority", wintypes.DWORD),
+        ("scheduling_class", wintypes.DWORD),
+    ]
+
+
+class _ExtendedLimits(ctypes.Structure):
+    _fields_ = [
+        ("basic", _BasicLimits), ("io_counters", ctypes.c_ulonglong * 6),
+        ("process_memory", ctypes.c_size_t), ("job_memory", ctypes.c_size_t),
+        ("peak_process_memory", ctypes.c_size_t), ("peak_job_memory", ctypes.c_size_t),
+    ]
+
+
+def _set_kill_on_close(api, handle, enabled: bool) -> None:
+    limits = _ExtendedLimits()
+    limits.basic.flags = 0x2000 if enabled else 0  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not api.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
 def job_is_empty(name: str | None, attached: bool, drained: bool = False) -> bool:
     """Fail closed on missing evidence, access errors, or surviving members."""
     if not name or not attached or not drained:
@@ -60,6 +88,35 @@ def job_is_empty(name: str | None, attached: bool, drained: bool = False) -> boo
         if not api.QueryInformationJobObject(handle, 1, ctypes.byref(info), ctypes.sizeof(info), None):
             return False
         return info.active_processes == 0
+    finally:
+        api.CloseHandle(handle)
+
+
+def terminate_job(name: str | None, attached: bool, timeout: float = 5) -> bool:
+    """Stop every member and retain the name until zero members is observed.
+
+    An absent job is not proof of termination, including for legacy launches.
+    This result is abnormal-stop evidence, never a successful worker result.
+    """
+    if not name or not attached:
+        return False
+    api = _kernel()
+    handle = api.OpenJobObjectW(4 | 8, False, name)  # QUERY | TERMINATE
+    if not handle:
+        return False
+    try:
+        if not api.TerminateJobObject(handle, 1):
+            return False
+        deadline = time.monotonic() + timeout
+        while True:
+            info = _Accounting()
+            if not api.QueryInformationJobObject(handle, 1, ctypes.byref(info), ctypes.sizeof(info), None):
+                return False
+            if info.active_processes == 0:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
     finally:
         api.CloseHandle(handle)
 
@@ -90,6 +147,9 @@ def supervise(database: str, task_id: str, run_id: int, name: str, command: list
     try:
         if ctypes.get_last_error() == 183:  # name must belong to this launch alone
             raise RuntimeError("Worker containment name already exists")
+        # A crashed supervisor must not leave its entire worker tree behind.
+        # Establish the policy before assigning any process or launching code.
+        _set_kill_on_close(api, handle, True)
         if not api.AssignProcessToJobObject(handle, api.GetCurrentProcess()):
             raise ctypes.WinError(ctypes.get_last_error())
         with sqlite3.connect(database, timeout=10) as conn:
@@ -133,6 +193,9 @@ def supervise(database: str, task_id: str, run_id: int, name: str, command: list
                 "pid": os.getpid(), "exitCode": result, "finishedAt": int(time.time()),
             }, sort_keys=True), encoding="utf-8")
             os.replace(temporary, target)
+        # Only this supervisor remains, and its drain has been committed.
+        # Avoid killing ourselves on a normal close and losing the true code.
+        _set_kill_on_close(api, handle, False)
         return result
     finally:
         api.CloseHandle(handle)

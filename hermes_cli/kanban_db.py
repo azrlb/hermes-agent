@@ -5321,17 +5321,40 @@ def stop_task(
     if not reason or reason.strip() != reason or len(reason) > 500:
         raise ValueError("stop reason must be non-empty, trimmed, and at most 500 characters")
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?", (task_id,),
+        "SELECT status, claim_lock, worker_pid, current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     if not row:
         return {"stopped": False, "reason": "not_found"}
-    if row["status"] in ("done", "archived", "blocked") and row["claim_lock"] is None:
+    run = conn.execute(
+        "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    windows_stop = _IS_WINDOWS and signal_fn is None
+    terminal = row["status"] in ("done", "archived", "blocked") and row["claim_lock"] is None
+    if windows_stop and run and run["worker_pid"]:
+        from hermes_cli.kanban_worker_job import job_is_empty, terminate_job
+        if terminal and job_is_empty(run["worker_job_name"], bool(run["worker_job_attached"]),
+                                     bool(run["worker_job_drained"])):
+            return {"stopped": True, "status": row["status"], "already_terminal": True}
+        # The saved unique job belongs to this exact attempt, even after the
+        # worker reports done and clears its task-level PID and claim.
+        termination = {
+            "prev_pid": run["worker_pid"], "host_local": True,
+            "termination_attempted": True,
+            "terminated": terminate_job(run["worker_job_name"], bool(run["worker_job_attached"])),
+            "worker_job_name": run["worker_job_name"], "sigkill": False,
+        }
+        if not termination["terminated"]:
+            return {"stopped": False, "reason": "process_tree_exit_unverified", **termination}
+    elif windows_stop and (row["worker_pid"] or row["claim_lock"]):
+        return {"stopped": False, "reason": "process_tree_identity_missing"}
+    elif terminal:
         return {"stopped": True, "status": row["status"], "already_terminal": True}
+    else:
+        termination = _terminate_reclaimed_worker(
+            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+        )
 
     prev_lock = row["claim_lock"]
-    termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn,
-    )
     if _worker_survived_termination(termination):
         _defer_reclaim_for_live_worker(
             conn, task_id, prev_lock, int(time.time()), termination,
@@ -5343,11 +5366,20 @@ def stop_task(
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL, "
-            "worker_pid=NULL, completed_at=? WHERE id=? AND claim_lock IS ?",
-            (now, task_id, prev_lock),
+            "worker_pid=NULL, completed_at=? WHERE id=? AND claim_lock IS ? "
+            "AND current_run_id IS ? "
+            "AND (SELECT MAX(id) FROM task_runs WHERE task_id=?) IS ?",
+            (now, task_id, prev_lock, row["current_run_id"], task_id, run["id"] if run else None),
         )
         if cur.rowcount != 1:
             return {"stopped": False, "reason": "ownership_changed"}
+        if windows_stop and run:
+            # TerminateJobObject + observed zero membership proves a stop,
+            # not successful completion. Preserve that distinction durably.
+            conn.execute(
+                "UPDATE task_runs SET worker_job_drained=1, worker_job_exit_code=1 WHERE id=?",
+                (run["id"],),
+            )
         run_id = _end_run(
             conn, task_id, outcome="cancelled", status="blocked",
             error=f"controller_stop: {reason}", metadata=termination,
@@ -5355,7 +5387,7 @@ def stop_task(
         _append_event(
             conn, task_id, "cancelled",
             {"reason": reason, "prev_lock": prev_lock, **termination},
-            run_id=run_id,
+            run_id=run_id or (run["id"] if run else None),
         )
     return {"stopped": True, "status": "blocked", **termination}
 

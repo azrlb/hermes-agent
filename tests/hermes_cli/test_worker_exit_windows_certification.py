@@ -16,11 +16,11 @@ from hermes_cli import kanban_db as kb
 
 @pytest.mark.windows_only
 @pytest.mark.parametrize("cooperative", [True, False], ids=["reaped-child", "orphan-child"])
-@pytest.mark.parametrize("mode", ["contained", "legacy-uncontained", "supervisor-crash"])
+@pytest.mark.parametrize("mode", ["contained", "legacy-uncontained", "legacy-stop", "supervisor-crash", "controller-stop", "controller-stop-running"])
 def test_terminal_certificate_requires_the_complete_process_tree(cooperative, mode):
     """A clean parent exit cannot certify a child that remains alive."""
     root = Path(__file__).resolve().parents[2]
-    contained = mode != "legacy-uncontained"
+    contained = not mode.startswith("legacy")
     code = """
 import json, os, subprocess, sys
 from agent.kanban_stop import reap_kanban_worker_descendants
@@ -57,13 +57,48 @@ if sys.argv[1] == 'reap':
         child = psutil.Process(identity["child"])
         assert child.is_running()
         kb._set_worker_pid(conn, tid, actual_pid)
-        assert kb.complete_task(conn, tid, expected_run_id=run_id)
+        if mode != "controller-stop-running":
+            assert kb.complete_task(conn, tid, expected_run_id=run_id)
         assert kb.certify_terminal_worker_exits(conn) == []
-        if mode == "supervisor-crash":
-            psutil.Process(worker.pid).kill()
-            worker.stdin.write("exit\n")
-            worker.stdin.flush()
+        if mode == "legacy-stop":
+            stopped = kb.stop_task(conn, tid, reason="must not guess legacy process ownership")
+            assert stopped["stopped"] is False
+            assert stopped["reason"] == "process_tree_exit_unverified"
+            assert child.is_running()
+            assert kb.get_task(conn, tid).status == "done"
+        if mode.startswith("controller-stop"):
+            stopped = kb.stop_task(conn, tid, reason="disposable full-tree stop")
+            assert stopped["stopped"] is True
+            child.wait(timeout=5)
             worker.communicate(timeout=15)
+            assert not child.is_running()
+            assert worker.returncode != 0
+            assert kb.get_task(conn, tid).status == "blocked"
+            assert conn.execute(
+                "SELECT worker_job_exit_code FROM task_runs WHERE id = ?", (run_id,),
+            ).fetchone()[0] == 1
+            conn.close()
+            conn = kb.connect()
+            assert kb.stop_task(conn, tid, reason="reopened stop replay")["stopped"] is True
+            kb.certify_terminal_worker_exits(conn)
+            assert conn.execute(
+                "SELECT worker_exit_kind FROM task_runs WHERE id = ?", (run_id,),
+            ).fetchone()[0] != "clean_exit"
+            return
+        if mode == "supervisor-crash":
+            payload = psutil.Process(identity["worker"])
+            psutil.Process(worker.pid).kill()
+            try:
+                child.wait(timeout=5)
+                payload.wait(timeout=5)
+            finally:
+                # Clean up the old implementation too when this regression fails.
+                if payload.is_running():
+                    payload.kill()
+                    payload.wait(timeout=5)
+            worker.communicate(timeout=15)
+            assert not child.is_running()
+            assert not payload.is_running()
             kb._record_worker_exit_code(actual_pid, worker.returncode)
             assert kb.certify_terminal_worker_exits(conn) == []
             assert conn.execute(
