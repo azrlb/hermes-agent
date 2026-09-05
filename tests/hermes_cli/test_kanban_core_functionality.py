@@ -721,6 +721,7 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     try:
         tid = kb.create_task(conn, title="skill-loading test",
                              assignee="some-profile")
+        assert kb.claim_task(conn, tid)
         task = kb.get_task(conn, tid)
         workspace = kb.resolve_workspace(task)
         pid = kb._default_spawn(task, str(workspace))

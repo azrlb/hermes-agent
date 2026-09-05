@@ -1537,6 +1537,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     worker_job_name     TEXT,
     worker_job_attached INTEGER NOT NULL DEFAULT 0,
     worker_job_drained  INTEGER NOT NULL DEFAULT 0,
+    worker_job_exit_code INTEGER,
     worker_exited_at    INTEGER,
     worker_exit_code    INTEGER,
     worker_exit_kind    TEXT,
@@ -2872,6 +2873,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             ("worker_job_name", "worker_job_name TEXT"),
             ("worker_job_attached", "worker_job_attached INTEGER NOT NULL DEFAULT 0"),
             ("worker_job_drained", "worker_job_drained INTEGER NOT NULL DEFAULT 0"),
+            ("worker_job_exit_code", "worker_job_exit_code INTEGER"),
             ("worker_exited_at", "worker_exited_at INTEGER"),
             ("worker_exit_code", "worker_exit_code INTEGER"),
             ("worker_exit_kind", "worker_exit_kind TEXT"),
@@ -2982,6 +2984,7 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, process_started_at INTEGER,"
         " worker_job_name TEXT, worker_job_attached INTEGER NOT NULL DEFAULT 0,"
         " worker_job_drained INTEGER NOT NULL DEFAULT 0,"
+        " worker_job_exit_code INTEGER,"
         " worker_exited_at INTEGER, worker_exit_code INTEGER,"
         " worker_exit_kind TEXT, worker_exit_delivery_attempts INTEGER NOT NULL DEFAULT 0,"
         " worker_exit_delivered_at INTEGER, worker_exit_delivery_error TEXT,"
@@ -9163,7 +9166,7 @@ def certify_terminal_worker_exits(conn: sqlite3.Connection) -> list[str]:
     payloads: list[dict] = []
     rows = conn.execute(
         "SELECT r.id, r.task_id, r.profile, r.outcome, r.worker_pid, "
-        "r.process_started_at, r.worker_job_name, r.worker_job_attached, r.worker_job_drained, "
+        "r.process_started_at, r.worker_job_name, r.worker_job_attached, r.worker_job_drained, r.worker_job_exit_code, "
         "t.idempotency_key AS dispatch_id "
         "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
         "WHERE r.ended_at IS NOT NULL AND r.worker_pid IS NOT NULL "
@@ -9181,6 +9184,9 @@ def certify_terminal_worker_exits(conn: sqlite3.Connection) -> list[str]:
                                 bool(row["worker_job_drained"])):
                 continue
         kind, code = _classify_worker_exit(pid)
+        if _IS_WINDOWS and row["worker_job_exit_code"] is not None:
+            code = int(row["worker_job_exit_code"])
+            kind = "clean_exit" if code == 0 else "nonzero_exit"
         exit_code = int(code) if code is not None else -1
         exited_at = int(time.time() * 1000)
         identity = {
@@ -11565,7 +11571,6 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
-    _live_worker_processes[int(proc.pid)] = proc
     return proc.pid
 
 

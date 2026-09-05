@@ -151,7 +151,12 @@ print(json.dumps({'child': child.pid}), flush=True)
         child.wait(timeout=5)
         assert proc.wait(timeout=10) == 0
         assert pid in kb.reap_worker_zombies()
+        # A restarted dispatcher has no process handles or in-memory exits.
+        kb._recent_worker_exits.clear()
+        conn.close()
+        conn = kb.connect()
         assert kb.certify_terminal_worker_exits(conn) == [tid]
+        assert kb.get_run(conn, task.current_run_id).worker_exit_code == 0
         assert kb.certify_terminal_worker_exits(conn) == []
     finally:
         if child is not None and child.is_running():

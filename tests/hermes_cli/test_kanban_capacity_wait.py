@@ -258,28 +258,14 @@ def test_dispatcher_supplies_exact_durable_exit_record_path(
 
     monkeypatch.setattr(kb.subprocess, "Popen", FakePopen)
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
-    task = kb.Task(
-        id="t_exit_record",
-        title="worker",
-        body=None,
-        assignee="coder",
-        status="running",
-        priority=0,
-        created_by=None,
-        created_at=0,
-        started_at=0,
-        completed_at=None,
-        workspace_kind="scratch",
-        workspace_path=str(workspace),
-        claim_lock="host:worker",
-        claim_expires=100,
-        tenant=None,
-        current_run_id=17,
-    )
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="worker", assignee="coder")
+        task = kb.claim_task(conn, tid)
+    assert task is not None
     try:
         assert kb._default_spawn(task, str(workspace)) == FakePopen.pid
         assert captured["env"]["HERMES_KANBAN_EXIT_RECORD"] == str(
-            kb._worker_exit_record_path(task.id, 17)
+            kb._worker_exit_record_path(task.id, task.current_run_id)
         )
         assert "-Q" in captured["cmd"]
     finally:

@@ -566,7 +566,7 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {target}" in listed
+    assert f"worktree {target.as_posix()}" in listed
     assert f"branch refs/heads/{branch}" in listed
 
 
@@ -825,24 +825,10 @@ class TestSharedBoardPaths:
 
         monkeypatch.setattr("subprocess.Popen", _FakePopen)
 
-        task = kb.Task(
-            id="t_dispatch_env",
-            title="x",
-            body=None,
-            assignee="coder",
-            status="ready",
-            priority=0,
-            created_by=None,
-            created_at=0,
-            started_at=None,
-            completed_at=None,
-            workspace_kind="worktree",
-            workspace_path=str(tmp_path / "ws"),
-            claim_lock=None,
-            claim_expires=None,
-            tenant=None,
-            branch_name="wt/t_dispatch_env",
-        )
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(conn, title="x", assignee="coder", workspace_kind="worktree", branch_name="wt/t_dispatch_env")
+            task = kb.claim_task(conn, tid)
+        assert task is not None
         kb._default_spawn(task, str(tmp_path / "ws"))
 
         env = captured["env"]
@@ -850,7 +836,7 @@ class TestSharedBoardPaths:
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(
             default_home / "kanban" / "workspaces"
         )
-        assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
+        assert env["HERMES_KANBAN_TASK"] == task.id
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
         for key in sc._VAR_MAP:
             if key == "HERMES_SESSION_SOURCE":
@@ -1183,12 +1169,11 @@ def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeyp
     `python -m hermes` which fails with `No module named hermes` on every
     invocation.
     """
-    import shutil
     import sys
     import hermes_cli.kanban_db as kb
 
     monkeypatch.delenv("HERMES_BIN", raising=False)
-    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(kb, "_safe_which_no_cwd", lambda name: None)
     argv = kb._resolve_hermes_argv()
     assert argv == [sys.executable, "-m", "hermes_cli.main"]
 

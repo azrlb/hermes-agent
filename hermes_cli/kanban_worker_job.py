@@ -8,6 +8,8 @@ evidence is not proof of exit. This module can run as a standalone bootstrap.
 from __future__ import annotations
 
 import ctypes
+import json
+import os
 from ctypes import wintypes
 from pathlib import Path
 import sqlite3
@@ -68,7 +70,7 @@ def prepare_worker_command(conn, task_id: str, run_id: int, command: list[str]) 
     database = conn.execute("PRAGMA database_list").fetchone()[2]
     with conn:
         changed = conn.execute(
-            "UPDATE task_runs SET worker_job_name = ?, worker_job_attached = 0, worker_job_drained = 0 "
+            "UPDATE task_runs SET worker_job_name = ?, worker_job_attached = 0, worker_job_drained = 0, worker_job_exit_code = NULL "
             "WHERE id = ? AND task_id = ? AND ended_at IS NULL "
             "AND EXISTS (SELECT 1 FROM tasks WHERE id = ? AND current_run_id = ?)",
             (name, run_id, task_id, task_id, run_id),
@@ -116,10 +118,21 @@ def supervise(database: str, task_id: str, run_id: int, name: str, command: list
             time.sleep(0.1)
         with sqlite3.connect(database, timeout=10) as conn:
             conn.execute(
-                "UPDATE task_runs SET worker_job_drained = 1 "
+                "UPDATE task_runs SET worker_job_drained = 1, worker_job_exit_code = ? "
                 "WHERE id = ? AND task_id = ? AND worker_job_name = ? AND worker_job_attached = 1",
-                (run_id, task_id, name),
+                (result, run_id, task_id, name),
             )
+        # Preserve the installed capacity-wait restart contract, now bound to
+        # the supervisor PID (the child interpreter has a different PID).
+        record = os.environ.get("HERMES_KANBAN_EXIT_RECORD")
+        if record and os.environ.get("HERMES_KANBAN_TASK") == task_id and os.environ.get("HERMES_KANBAN_RUN_ID") == str(run_id):
+            target = Path(record)
+            temporary = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+            temporary.write_text(json.dumps({
+                "version": 1, "taskId": task_id, "runId": run_id,
+                "pid": os.getpid(), "exitCode": result, "finishedAt": int(time.time()),
+            }, sort_keys=True), encoding="utf-8")
+            os.replace(temporary, target)
         return result
     finally:
         api.CloseHandle(handle)
