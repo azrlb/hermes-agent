@@ -32,6 +32,13 @@ WORKER_HOOKS = (
 
 
 @pytest.fixture
+def empty_process_group(monkeypatch):
+    """Isolate callback tests from OS containment (real Windows tests cover it)."""
+    from hermes_cli import kanban_worker_job
+    monkeypatch.setattr(kanban_worker_job, "job_is_empty", lambda *args: True)
+
+
+@pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -127,7 +134,7 @@ def test_crash_reclaim_fires_worker_exited(kanban_home, captured_hooks, monkeypa
 
 
 def test_terminal_run_waits_for_exact_process_exit_then_certifies_once(
-    kanban_home, captured_hooks, monkeypatch,
+    kanban_home, captured_hooks, monkeypatch, empty_process_group,
 ):
     """A logical completion is not an exit; the later OS exit is durable."""
     conn = kb.connect()
@@ -215,7 +222,7 @@ def test_terminal_run_waits_for_exact_process_exit_then_certifies_once(
 
 
 def test_exit_callback_retries_are_bounded_and_poll_proof_remains(
-    kanban_home, monkeypatch,
+    kanban_home, monkeypatch, empty_process_group,
 ):
     marker = {
         "controllerRunId": "controller-241", "eventSequence": 1,
@@ -254,7 +261,7 @@ def test_exit_callback_retries_are_bounded_and_poll_proof_remains(
 
 
 def test_terminal_exit_with_unknown_code_is_not_reported_clean(
-    kanban_home, monkeypatch,
+    kanban_home, monkeypatch, empty_process_group,
 ):
     """A lost/restarted watcher fails closed instead of inventing rc=0."""
     conn = kb.connect()
@@ -275,7 +282,7 @@ def test_terminal_exit_with_unknown_code_is_not_reported_clean(
 
 
 def test_exit_certifier_ignores_crash_retries_and_preserves_blocked_workspace(
-    kanban_home, monkeypatch,
+    kanban_home, monkeypatch, empty_process_group,
 ):
     """Only terminal handoffs are certified; blocked work remains available."""
     conn = kb.connect()

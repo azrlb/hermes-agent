@@ -1507,6 +1507,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_expires       INTEGER,
     worker_pid          INTEGER,
     process_started_at  INTEGER,
+    worker_job_name     TEXT,
+    worker_job_attached INTEGER NOT NULL DEFAULT 0,
+    worker_job_drained  INTEGER NOT NULL DEFAULT 0,
     worker_exited_at    INTEGER,
     worker_exit_code    INTEGER,
     worker_exit_kind    TEXT,
@@ -2839,6 +2842,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         }
         for name, definition in (
             ("process_started_at", "process_started_at INTEGER"),
+            ("worker_job_name", "worker_job_name TEXT"),
+            ("worker_job_attached", "worker_job_attached INTEGER NOT NULL DEFAULT 0"),
+            ("worker_job_drained", "worker_job_drained INTEGER NOT NULL DEFAULT 0"),
             ("worker_exited_at", "worker_exited_at INTEGER"),
             ("worker_exit_code", "worker_exit_code INTEGER"),
             ("worker_exit_kind", "worker_exit_kind TEXT"),
@@ -2947,6 +2953,8 @@ _REBUILD_SPECS = {
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
         " worker_pid INTEGER, process_started_at INTEGER,"
+        " worker_job_name TEXT, worker_job_attached INTEGER NOT NULL DEFAULT 0,"
+        " worker_job_drained INTEGER NOT NULL DEFAULT 0,"
         " worker_exited_at INTEGER, worker_exit_code INTEGER,"
         " worker_exit_kind TEXT, worker_exit_delivery_attempts INTEGER NOT NULL DEFAULT 0,"
         " worker_exit_delivered_at INTEGER, worker_exit_delivery_error TEXT,"
@@ -8954,7 +8962,8 @@ def certify_terminal_worker_exits(conn: sqlite3.Connection) -> list[str]:
     payloads: list[dict] = []
     rows = conn.execute(
         "SELECT r.id, r.task_id, r.profile, r.outcome, r.worker_pid, "
-        "r.process_started_at, t.idempotency_key AS dispatch_id "
+        "r.process_started_at, r.worker_job_name, r.worker_job_attached, r.worker_job_drained, "
+        "t.idempotency_key AS dispatch_id "
         "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
         "WHERE r.ended_at IS NOT NULL AND r.worker_pid IS NOT NULL "
         "AND r.outcome IN ('completed', 'blocked') "
@@ -8965,6 +8974,11 @@ def certify_terminal_worker_exits(conn: sqlite3.Connection) -> list[str]:
         started_at = row["process_started_at"]
         if _same_process_instance(pid, started_at):
             continue
+        if _IS_WINDOWS:
+            from hermes_cli.kanban_worker_job import job_is_empty
+            if not job_is_empty(row["worker_job_name"], bool(row["worker_job_attached"]),
+                                bool(row["worker_job_drained"])):
+                continue
         kind, code = _classify_worker_exit(pid)
         exit_code = int(code) if code is not None else -1
         exited_at = int(time.time() * 1000)
@@ -11291,6 +11305,10 @@ def _default_spawn(
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     try:
+        if _IS_WINDOWS:
+            from hermes_cli.kanban_worker_job import prepare_worker_command
+            with connect_closing(board=board) as job_conn:
+                cmd = prepare_worker_command(job_conn, task.id, task.current_run_id, cmd)
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
