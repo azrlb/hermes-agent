@@ -5155,6 +5155,7 @@ def release_stale_claims(
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            conn=conn, task_id=row["id"],
         )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -5255,6 +5256,7 @@ def reclaim_task(
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        conn=conn, task_id=task_id,
     )
     # A manual stop request is not proof that the process stopped. Keep the
     # claim counted while a host-local worker survives termination so callers
@@ -8619,6 +8621,8 @@ def _terminate_reclaimed_worker(
     claim_lock: Optional[str],
     *,
     signal_fn=None,
+    conn: Optional[sqlite3.Connection] = None,
+    task_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths."""
     import signal
@@ -8630,6 +8634,38 @@ def _terminate_reclaimed_worker(
         "terminated": False,
         "sigkill": False,
     }
+    if _IS_WINDOWS and signal_fn is None:
+        # A missing parent PID is not proof that its children exited. Resolve
+        # the unique containment job through the still-owned attempt instead.
+        info["process_tree_exit_unverified"] = True
+        if conn is None or task_id is None:
+            return info
+        run = conn.execute(
+            "SELECT r.* FROM task_runs r JOIN tasks t ON t.current_run_id=r.id "
+            "WHERE t.id=? AND t.claim_lock IS ? AND r.claim_lock IS ?",
+            (task_id, claim_lock, claim_lock),
+        ).fetchone()
+        if run is None or not claim_lock:
+            return info
+        host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+        if not str(claim_lock).startswith(host_prefix):
+            return info
+        from hermes_cli.kanban_worker_job import job_is_empty, terminate_job
+        info.update(host_local=True, termination_attempted=True,
+                    worker_job_name=run["worker_job_name"], run_id=run["id"])
+        info["terminated"] = job_is_empty(
+            run["worker_job_name"], bool(run["worker_job_attached"]),
+            bool(run["worker_job_drained"]),
+        ) or terminate_job(run["worker_job_name"], bool(run["worker_job_attached"]))
+        info["process_tree_exit_unverified"] = not info["terminated"]
+        if info["terminated"]:
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE task_runs SET worker_job_drained=1, worker_job_exit_code=1 "
+                    "WHERE id=? AND claim_lock IS ?",
+                    (run["id"], claim_lock),
+                )
+        return info
     if not pid or pid <= 0 or not claim_lock:
         return info
 
@@ -8686,7 +8722,8 @@ def _worker_survived_termination(termination: dict) -> bool:
     to the normal release path, since we cannot manage that worker anyway.
     """
     return bool(
-        termination.get("termination_attempted")
+        termination.get("process_tree_exit_unverified")
+        or termination.get("termination_attempted")
         and termination.get("host_local")
         and not termination.get("terminated")
     )
@@ -8829,31 +8866,15 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
-        # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
-        killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        termination = _terminate_reclaimed_worker(
+            pid, lock, signal_fn=signal_fn, conn=conn, task_id=tid,
         )
-        if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, tid, lock, now, termination, reason="max_runtime_worker_alive",
+            )
+            continue
+        killed = termination["sigkill"]
 
         with write_txn(conn):
             retry_status = _retry_status_for_run(conn, tid)
@@ -8867,6 +8888,7 @@ def enforce_max_runtime(
             )
             if cur.rowcount == 1:
                 payload = {
+                    **termination,
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
                     "limit_seconds": int(row["max_runtime_seconds"]),
@@ -8980,6 +9002,7 @@ def detect_stale_running(
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn,
+            conn=conn, task_id=tid,
         )
 
         # Never release a claim while our own worker is still alive: that would

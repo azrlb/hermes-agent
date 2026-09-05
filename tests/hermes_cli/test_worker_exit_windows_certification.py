@@ -16,7 +16,7 @@ from hermes_cli import kanban_db as kb
 
 @pytest.mark.windows_only
 @pytest.mark.parametrize("cooperative", [True, False], ids=["reaped-child", "orphan-child"])
-@pytest.mark.parametrize("mode", ["contained", "legacy-uncontained", "legacy-stop", "supervisor-crash", "controller-stop", "controller-stop-running"])
+@pytest.mark.parametrize("mode", ["contained", "legacy-uncontained", "legacy-stop", "supervisor-crash", "controller-stop", "controller-stop-running", "manual-reclaim", "ttl-reclaim", "heartbeat-reclaim", "runtime-reclaim", "legacy-reclaim"])
 def test_terminal_certificate_requires_the_complete_process_tree(cooperative, mode):
     """A clean parent exit cannot certify a child that remains alive."""
     root = Path(__file__).resolve().parents[2]
@@ -57,9 +57,41 @@ if sys.argv[1] == 'reap':
         child = psutil.Process(identity["child"])
         assert child.is_running()
         kb._set_worker_pid(conn, tid, actual_pid)
-        if mode != "controller-stop-running":
+        reclaiming = mode.endswith("reclaim")
+        if mode != "controller-stop-running" and not reclaiming:
             assert kb.complete_task(conn, tid, expected_run_id=run_id)
         assert kb.certify_terminal_worker_exits(conn) == []
+        if reclaiming:
+            if mode == "ttl-reclaim":
+                with kb.write_txn(conn):
+                    conn.execute("UPDATE tasks SET claim_expires=1, last_heartbeat_at=1 WHERE id=?", (tid,))
+                result = kb.release_stale_claims(conn) == 1
+            elif mode in ("heartbeat-reclaim", "runtime-reclaim"):
+                with kb.write_txn(conn):
+                    conn.execute("UPDATE tasks SET last_heartbeat_at=1, max_runtime_seconds=1 WHERE id=?", (tid,))
+                    conn.execute("UPDATE task_runs SET started_at=1 WHERE id=?", (run_id,))
+                result = tid in (kb.enforce_max_runtime(conn) if mode == "runtime-reclaim"
+                                 else kb.detect_stale_running(conn, stale_timeout_seconds=1))
+            else:
+                result = kb.reclaim_task(conn, tid, reason="disposable full-tree reclaim")
+            if mode == "legacy-reclaim":
+                assert result is False
+                assert child.is_running()
+                assert kb.get_task(conn, tid).claim_lock is not None
+                return
+            assert result is True
+            child.wait(timeout=5)
+            worker.communicate(timeout=15)
+            assert not child.is_running()
+            assert worker.returncode != 0
+            assert kb.get_task(conn, tid).claim_lock is None
+            conn.close()
+            conn = kb.connect()
+            run = conn.execute("SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
+            assert run["worker_job_drained"] == 1
+            assert run["worker_job_exit_code"] == 1
+            assert run["worker_exit_kind"] != "clean_exit"
+            return
         if mode == "legacy-stop":
             stopped = kb.stop_task(conn, tid, reason="must not guess legacy process ownership")
             assert stopped["stopped"] is False

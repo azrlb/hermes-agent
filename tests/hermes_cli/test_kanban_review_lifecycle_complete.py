@@ -333,6 +333,12 @@ def test_interrupted_review_runs_retry_in_review_phase(
     conn,
     reclaim_kind: str,
 ) -> None:
+    # This is a phase-routing test with no spawned worker. Use the explicit
+    # signal seam; native Windows stop proof is tested with real processes in
+    # test_worker_exit_windows_certification.py, not inferred from an empty PID.
+    def simulated_signal(*_args):
+        return None
+
     task_id, review = _claimed_review(
         conn,
         f"Retry review after {reclaim_kind}",
@@ -352,9 +358,9 @@ def test_interrupted_review_runs_retry_in_review_phase(
                 "UPDATE tasks SET claim_expires = ? WHERE id = ?",
                 (int(time.time()) - 1, task_id),
             )
-        assert kb.release_stale_claims(conn) == 1
+        assert kb.release_stale_claims(conn, signal_fn=simulated_signal) == 1
     elif reclaim_kind == "manual_reclaim":
-        assert kb.reclaim_task(conn, task_id, reason="operator retry")
+        assert kb.reclaim_task(conn, task_id, reason="operator retry", signal_fn=simulated_signal)
     else:
         old = int(time.time()) - 1_000
         with kb.write_txn(conn):
@@ -367,7 +373,7 @@ def test_interrupted_review_runs_retry_in_review_phase(
                 "UPDATE task_runs SET started_at = ? WHERE id = ?",
                 (old, review.current_run_id),
             )
-        assert kb.detect_stale_running(conn, stale_timeout_seconds=1) == [task_id]
+        assert kb.detect_stale_running(conn, stale_timeout_seconds=1, signal_fn=simulated_signal) == [task_id]
 
     retried = kb.get_task(conn, task_id)
     assert retried is not None
