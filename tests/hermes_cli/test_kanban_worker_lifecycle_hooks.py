@@ -24,6 +24,20 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli.plugins import VALID_HOOKS, get_plugin_manager
 
+
+def test_show_explicitly_refreshes_only_requested_task(monkeypatch, capsys):
+    from argparse import Namespace
+    from hermes_cli.kanban import _cmd_show
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="isolated polling target", assignee="probe")
+    refreshed = []
+    monkeypatch.setattr(kb, "certify_terminal_worker_exits",
+                        lambda conn, task_id=None: refreshed.append(task_id))
+    assert _cmd_show(Namespace(task_id=tid, json=True, refresh_worker_exit=True,
+                               state_type=None, state_name=None)) == 0
+    assert refreshed == [tid]
+    assert json.loads(capsys.readouterr().out)["task"]["id"] == tid
+
 WORKER_HOOKS = (
     "on_kanban_worker_spawned",
     "on_kanban_worker_exited",

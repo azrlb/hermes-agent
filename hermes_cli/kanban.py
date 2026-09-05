@@ -498,6 +498,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_show = sub.add_parser("show", help="Show a task with comments + events")
     p_show.add_argument("task_id")
     p_show.add_argument("--json", action="store_true")
+    p_show.add_argument("--refresh-worker-exit", action="store_true",
+                        help="Reconcile this task's exact process-exit proof before reading")
     p_show.add_argument(
         "--state-type",
         choices=("status", "outcome"),
@@ -1807,6 +1809,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         if not task:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
+        if getattr(args, "refresh_worker_exit", False):
+            kb.certify_terminal_worker_exits(conn, task_id=args.task_id)
         comments = kb.list_comments(conn, args.task_id)
         events = kb.list_events(conn, args.task_id)
         parents = kb.parent_ids(conn, args.task_id)

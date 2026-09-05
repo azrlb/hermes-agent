@@ -9153,7 +9153,7 @@ def _same_process_instance(pid: int, expected_started_at: Optional[int]) -> bool
         return True
 
 
-def certify_terminal_worker_exits(conn: sqlite3.Connection) -> list[str]:
+def certify_terminal_worker_exits(conn: sqlite3.Connection, task_id: Optional[str] = None) -> list[str]:
     """Persist proof that a logically terminal run's exact process is gone.
 
     Completion and process exit are deliberately separate facts.  A worker can
@@ -9171,7 +9171,8 @@ def certify_terminal_worker_exits(conn: sqlite3.Connection) -> list[str]:
         "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
         "WHERE r.ended_at IS NOT NULL AND r.worker_pid IS NOT NULL "
         "AND r.outcome IN ('completed', 'blocked') "
-        "AND r.worker_exited_at IS NULL ORDER BY r.id"
+        "AND r.worker_exited_at IS NULL AND (? IS NULL OR r.task_id = ?) ORDER BY r.id",
+        (task_id, task_id),
     ).fetchall()
     for row in rows:
         pid = int(row["worker_pid"])
