@@ -17,6 +17,7 @@ Two-part fix under test:
 from __future__ import annotations
 
 import subprocess
+import json
 from pathlib import Path
 
 import pytest
@@ -64,6 +65,34 @@ def _make_repo(tmp_path: Path) -> Path:
 def _add_worktree(repo: Path, target: Path, branch: str) -> Path:
     _git(repo, "worktree", "add", str(target), "-b", branch, "HEAD")
     return target
+
+
+@pytest.mark.parametrize("case", ["prepared", "wrong-branch", "missing", "legacy"])
+def test_controller_requires_exact_prepared_worktree(kanban_home, tmp_path, case):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "assigned"
+    expected_branch = "codex/controller-assigned"
+    if case != "missing":
+        _add_worktree(repo, target, expected_branch if case != "wrong-branch" else "codex/other")
+        (target / "saved-work.txt").write_text("preserve this", encoding="utf-8")
+    metadata = {"controllerRunId": "disposable-controller"}
+    if case != "legacy":
+        metadata["preparedWorkspace"] = {"version": 1, "path": str(target), "branch": expected_branch}
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="controller assignment", body="<!-- codex-bmad-lifecycle " + json.dumps(metadata) + " -->",
+                             workspace_kind="worktree", workspace_path=str(target), branch_name=expected_branch)
+        task = kb.get_task(conn, tid)
+    before = subprocess.check_output(["git", "-C", str(repo), "worktree", "list", "--porcelain"], text=True)
+    if case == "prepared":
+        assert kb._resolve_worktree_workspace(task) == (target.resolve(), expected_branch)
+    else:
+        with pytest.raises(ValueError, match="controller.*prepared worktree"):
+            kb._resolve_worktree_workspace(task)
+    assert subprocess.check_output(["git", "-C", str(repo), "worktree", "list", "--porcelain"], text=True) == before
+    if case != "missing":
+        assert (target / "saved-work.txt").read_text(encoding="utf-8") == "preserve this"
+    else:
+        assert not target.exists()
 
 
 def test_decompose_worktree_children_get_own_workspace(kanban_home):
@@ -124,7 +153,6 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert head == "wt/sibling"
-
 
 
 

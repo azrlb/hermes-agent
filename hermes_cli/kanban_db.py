@@ -8058,6 +8058,29 @@ def _resolve_worktree_workspace(
     anywhere, we fail loudly rather than guess.
     """
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    if re.search(r"<!--\s*codex-bmad-lifecycle\b", task.body or ""):
+        # Controller preparation belongs to one exact checkout. The ordinary
+        # sibling fallback below would discard that evidence by changing paths.
+        # Legacy/malformed assignments must migrate, not silently self-heal.
+        try:
+            markers = list(_CONTROLLER_LIFECYCLE_MARKER.finditer(task.body or ""))
+            if len(markers) != 1:
+                raise ValueError("ambiguous assignment")
+            metadata = json.loads(markers[0].group(1))
+            prepared = metadata["preparedWorkspace"]
+            if (prepared.get("version") != 1 or not isinstance(prepared.get("path"), str)
+                    or prepared.get("branch") != task.branch_name or not task.workspace_path):
+                raise ValueError("incomplete assignment")
+            requested = Path(task.workspace_path)
+            expected = Path(prepared["path"])
+            if (not requested.is_absolute() or not expected.is_absolute()
+                    or requested != expected or requested != requested.resolve(strict=True)
+                    or not _is_linked_worktree_checkout(requested)
+                    or _git_current_branch(requested) != task.branch_name):
+                raise ValueError("changed assignment")
+            return requested.resolve(strict=True), task.branch_name
+        except (ValueError, TypeError, KeyError, AttributeError, OSError) as exc:
+            raise ValueError("controller task requires its exact prepared worktree; hold for recovery") from exc
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
