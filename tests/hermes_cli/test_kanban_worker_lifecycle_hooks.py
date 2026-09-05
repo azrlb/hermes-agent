@@ -275,6 +275,49 @@ def test_exit_callback_retries_are_bounded_and_poll_proof_remains(
     assert any(event.kind == "worker_exit_delivery_abandoned" for event in events)
 
 
+@pytest.mark.parametrize("newer_attempt", [False, True])
+def test_abnormal_exit_preserves_workspace_and_only_latest_attempt_can_deliver(
+    kanban_home, monkeypatch, empty_process_group, newer_attempt,
+):
+    marker = {"controllerRunId": "failure-probe", "eventSequence": 1,
+              "dispatchId": "failure-dispatch", "stateUrl": "https://test/state",
+              "submitUrl": "https://test/submit"}
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="failure probe", assignee="worker",
+                             idempotency_key="failure-dispatch",
+                             body=f"<!-- codex-bmad-lifecycle {json.dumps(marker)} -->")
+        task = kb.claim_task(conn, tid)
+        workspace = kb.workspaces_root() / f"scratch-{tid}"
+        workspace.mkdir(parents=True)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_kind='scratch', workspace_path=? WHERE id=?",
+                         (str(workspace), tid))
+        kb._set_worker_pid(conn, tid, 98771)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_runs SET process_started_at=1234 WHERE id=?", (task.current_run_id,))
+        assert kb.complete_task(conn, tid, expected_run_id=task.current_run_id)
+        monkeypatch.setattr(kb, "_same_process_instance", lambda *_args: False)
+        monkeypatch.setattr(kb, "_classify_worker_exit", lambda *_args: ("nonzero_exit", 1))
+        assert kb.certify_terminal_worker_exits(conn, tid) == [tid]
+        assert workspace.exists(), "failed output must remain recoverable"
+        if newer_attempt:
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+            assert kb.claim_task(conn, tid)
+        calls = []
+        def transport(url, body):
+            calls.append(body)
+            return {"expectedEventSequence": 2} if url.endswith("/state") else {"accepted": True}
+        result = kb.deliver_worker_exit_certificates(conn, key_id="test", secret="test-key", transport=transport)
+        if newer_attempt:
+            assert result == []
+            assert calls == []
+        else:
+            assert result == [tid]
+            assert calls[-1]["payload"]["certificate"]["terminalResult"] == "failed"
+            assert calls[-1]["payload"]["certificate"]["exitCode"] == 1
+
+
 def test_terminal_exit_with_unknown_code_is_not_reported_clean(
     kanban_home, monkeypatch, empty_process_group,
 ):
@@ -296,10 +339,10 @@ def test_terminal_exit_with_unknown_code_is_not_reported_clean(
     assert run.worker_exit_kind == "unknown"
 
 
-def test_exit_certifier_ignores_crash_retries_and_preserves_blocked_workspace(
+def test_exit_certifier_records_crash_exit_and_preserves_blocked_workspace(
     kanban_home, monkeypatch, empty_process_group,
 ):
-    """Only terminal handoffs are certified; blocked work remains available."""
+    """Abnormal attempts have exit proof too; blocked work remains available."""
     conn = kb.connect()
     try:
         crashed = kb.create_task(conn, title="crash", assignee="worker")
@@ -328,8 +371,8 @@ def test_exit_certifier_ignores_crash_retries_and_preserves_blocked_workspace(
 
         monkeypatch.setattr(kb, "_same_process_instance", lambda pid, started: False)
         monkeypatch.setattr(kb, "_classify_worker_exit", lambda pid: ("clean_exit", 0))
-        assert kb.certify_terminal_worker_exits(conn) == [blocked]
-        assert kb.get_run(conn, crash_run).worker_exited_at is None
+        assert kb.certify_terminal_worker_exits(conn) == [crashed, blocked]
+        assert kb.get_run(conn, crash_run).worker_exited_at is not None
         assert kb.get_run(conn, blocked_run).worker_exited_at is not None
         assert blocked_workspace.exists()
     finally:

@@ -191,6 +191,11 @@ sys.exit(int(sys.argv[2]))
             assert run["worker_job_drained"] == 1
             assert run["worker_job_exit_code"] == 1
             assert run["worker_exit_kind"] != "clean_exit"
+            assert kb.certify_terminal_worker_exits(conn, tid) == [tid]
+            proof = kb.get_run(conn, run_id)
+            assert proof.worker_exit_code == 1
+            assert proof.worker_exit_kind == "nonzero_exit"
+            assert kb.certify_terminal_worker_exits(conn, tid) == []
             return
         if mode == "legacy-stop":
             stopped = kb.stop_task(conn, tid, reason="must not guess legacy process ownership")
@@ -212,7 +217,7 @@ sys.exit(int(sys.argv[2]))
             conn.close()
             conn = kb.connect()
             assert kb.stop_task(conn, tid, reason="reopened stop replay")["stopped"] is True
-            kb.certify_terminal_worker_exits(conn)
+            assert kb.certify_terminal_worker_exits(conn, tid) == [tid]
             assert conn.execute(
                 "SELECT worker_exit_kind FROM task_runs WHERE id = ?", (run_id,),
             ).fetchone()[0] != "clean_exit"

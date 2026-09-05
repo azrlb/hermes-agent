@@ -9305,7 +9305,7 @@ def certify_terminal_worker_exits(conn: sqlite3.Connection, task_id: Optional[st
         "t.idempotency_key AS dispatch_id "
         "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
         "WHERE r.ended_at IS NOT NULL AND r.worker_pid IS NOT NULL "
-        "AND r.outcome IN ('completed', 'blocked') "
+        "AND r.outcome IN ('completed', 'blocked', 'cancelled', 'reclaimed', 'stale', 'timed_out', 'crashed') "
         "AND r.worker_exited_at IS NULL AND (? IS NULL OR r.task_id = ?) ORDER BY r.id",
         (task_id, task_id),
     ).fetchall()
@@ -9372,7 +9372,13 @@ def certify_terminal_worker_exits(conn: sqlite3.Connection, task_id: Optional[st
             )
     for task_id in dict.fromkeys(certified):
         task = get_task(conn, task_id)
-        if task is not None and task.status == "done":
+        latest = conn.execute(
+            "SELECT outcome, worker_exit_code, worker_exit_kind FROM task_runs "
+            "WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        if (task is not None and task.status == "done" and latest
+                and latest["outcome"] == "completed" and latest["worker_exit_code"] == 0
+                and latest["worker_exit_kind"] == "clean_exit"):
             _cleanup_workspace(conn, task_id)
     return certified
 
@@ -9431,6 +9437,7 @@ def deliver_worker_exit_certificates(
         "SELECT r.*, t.body, t.idempotency_key FROM task_runs r "
         "JOIN tasks t ON t.id = r.task_id "
         "WHERE r.worker_exited_at IS NOT NULL AND r.worker_exited_at > 0 "
+        "AND r.id = (SELECT MAX(newer.id) FROM task_runs newer WHERE newer.task_id=r.task_id) "
         "AND r.worker_exit_delivered_at IS NULL "
         "AND r.worker_exit_delivery_attempts < ? ORDER BY r.id",
         (_WORKER_EXIT_DELIVERY_LIMIT,),
@@ -9450,7 +9457,8 @@ def deliver_worker_exit_certificates(
             state = send(state_url, {})
             event_sequence = int(state["expectedEventSequence"])
             terminal_result = (
-                "done" if row["outcome"] == "completed"
+                "failed" if row["worker_exit_code"] != 0
+                else "done" if row["outcome"] == "completed"
                 else "blocked" if row["outcome"] == "blocked"
                 else "failed"
             )
