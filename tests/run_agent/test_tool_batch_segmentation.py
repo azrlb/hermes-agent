@@ -682,7 +682,14 @@ class TestPathCanonicalization:
         target.touch()
 
         alias_dir = tmp_path / "alias"
-        alias_dir.symlink_to(real_dir)
+        if os.name == "nt":
+            # Directory junctions exercise real alias resolution on Windows
+            # without requiring the operator's symbolic-link privilege.
+            import subprocess
+            subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(alias_dir), str(real_dir)],
+                           check=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        else:
+            alias_dir.symlink_to(real_dir, target_is_directory=True)
 
         real_path = _canonical_path(str(target))
         alias_path = _canonical_path(str(alias_dir / "config.json"))

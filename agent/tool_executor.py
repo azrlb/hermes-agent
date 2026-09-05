@@ -1108,6 +1108,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     tool_calls = assistant_message.tool_calls
     num_tools = len(tool_calls)
 
+    if _skip_tools_after_worker_completion(agent, messages, tool_calls, effective_task_id):
+        return
+
     # Resolve the context-scaled tool-output budget once per turn (cheap, but
     # avoids rebuilding it per result inside the loop below).
     _tool_budget = _budget_for_agent(agent)
@@ -1949,6 +1952,29 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
         ))
 
 
+def _skip_tools_after_worker_completion(agent, messages, tool_calls, effective_task_id) -> bool:
+    """Preserve result pairing while refusing effects after exact-run completion."""
+    from agent.kanban_stop import kanban_stop_nudge_enabled, worker_attempt_is_terminal
+
+    if not kanban_stop_nudge_enabled() or not worker_attempt_is_terminal():
+        return False
+    for call in tool_calls:
+        name = call.function.name
+        result = f"[Tool execution cancelled — {name} was not started: worker attempt is terminal]"
+        messages.append(make_tool_result_message(
+            name, result, _pairing_tool_call_id(call), effect_disposition="none",
+        ))
+        _emit_terminal_post_tool_call(
+            agent, function_name=name, function_args={}, result=result,
+            effective_task_id=effective_task_id, tool_call_id=getattr(call, "id", "") or "",
+            status="cancelled", error_type="worker_attempt_terminal",
+            error_message="Worker attempt completed before tool start",
+        )
+        if not _flush_session_db_after_tool_progress(agent, messages, stage=f"terminal worker skipped {name}"):
+            break
+    return True
+
+
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
@@ -1968,6 +1994,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         tool_call_id = _pairing_tool_call_id(tool_call)
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        if _skip_tools_after_worker_completion(agent, messages, assistant_message.tool_calls[i-1:], effective_task_id):
+            break
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
         # do NOT start any more tools -- skip them all immediately.

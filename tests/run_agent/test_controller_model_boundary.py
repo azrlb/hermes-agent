@@ -20,7 +20,7 @@ def test_controlled_model_writes_real_worker_evidence(tmp_path, monkeypatch):
     _run_controlled_model(tmp_path, monkeypatch)
 
 
-def _run_controlled_model(tmp_path, monkeypatch, *, kanban_worker=False, cli_completion=False):
+def _run_controlled_model(tmp_path, monkeypatch, *, kanban_worker=False, cli_completion=False, trailing_tool=False):
     original_connect = socket.socket.connect
 
     def refuse_network(sock, address):
@@ -63,6 +63,14 @@ def _run_controlled_model(tmp_path, monkeypatch, *, kanban_worker=False, cli_com
                 else:
                     name, args = "kanban_complete", {"summary": "Evidence saved in Git."}
             tools = [SimpleNamespace(id=f"worker-step-{len(calls)}", type="function", function=SimpleNamespace(name=name, arguments=json.dumps(args)))]
+            if trailing_tool and len(calls) == 4:
+                tools.append(SimpleNamespace(id="forbidden-after-completion", type="function", function=SimpleNamespace(
+                    name="write_file", arguments=json.dumps({"path": str(artifact), "content": "changed after completion\n"}))))
+                if cli_completion:
+                    # Two non-overlapping writes form a genuinely parallel
+                    # segment after the terminal CLI barrier.
+                    tools.append(SimpleNamespace(id="forbidden-parallel-write", type="function", function=SimpleNamespace(
+                        name="write_file", arguments=json.dumps({"path": str(tmp_path / "forbidden.md"), "content": "must not exist\n"}))))
             content = None
         else:
             assert len(calls) == 2, "unexpected model retry"
@@ -82,11 +90,18 @@ def _run_controlled_model(tmp_path, monkeypatch, *, kanban_worker=False, cli_com
         assert result["final_response"] == "Evidence saved."
     assert len(calls) == (4 if kanban_worker else 2)
     assert artifact.read_text(encoding="utf-8") == "verified fixture output\n"
+    assert not (tmp_path / "forbidden.md").exists()
+    if trailing_tool:
+        skipped = [message for message in agent._session_messages if message.get("role") == "tool"
+                   and message.get("tool_call_id", "").startswith("forbidden-")]
+        assert len(skipped) == (2 if cli_completion else 1)
+        assert all("worker attempt is terminal" in message["content"] for message in skipped)
 
 
 @pytest.mark.windows_only
 @pytest.mark.parametrize("cli_completion", [False, True], ids=["model-tool", "receipt-cli-path"])
-def test_supervised_agent_saves_git_output_and_fresh_observer_certifies_exit(tmp_path, cli_completion):
+@pytest.mark.parametrize("trailing_tool", [False, True], ids=["single", "trailing-write"])
+def test_supervised_agent_saves_git_output_and_fresh_observer_certifies_exit(tmp_path, cli_completion, trailing_tool):
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_worker_job import prepare_worker_command
 
@@ -107,12 +122,12 @@ from pathlib import Path
 import pytest
 from hermes_cli import kanban_db as kb
 with pytest.MonkeyPatch.context() as isolated:
-    runpy.run_path(sys.argv[1])['_run_controlled_model'](Path(sys.argv[2]), isolated, kanban_worker=True, cli_completion=sys.argv[3] == 'True')
+    runpy.run_path(sys.argv[1])['_run_controlled_model'](Path(sys.argv[2]), isolated, kanban_worker=True, cli_completion=sys.argv[3] == 'True', trailing_tool=sys.argv[4] == 'True')
 print('WORKER_ASSERTIONS_PASSED', flush=True)
 kb.write_kanban_worker_exit_record(0)
 """
         command = prepare_worker_command(conn, tid, run_id,
-                                         [sys.executable, "-u", "-c", code, str(Path(__file__).resolve()), str(workspace), str(cli_completion)])
+                                         [sys.executable, "-u", "-c", code, str(Path(__file__).resolve()), str(workspace), str(cli_completion), str(trailing_tool)])
         worker = subprocess.Popen(command, cwd=root, env=environment, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
         kb._set_worker_pid(conn, tid, worker.pid)
