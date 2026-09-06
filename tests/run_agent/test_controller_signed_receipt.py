@@ -192,13 +192,13 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
         else:
             context_path = tmp_path / "receipt-context.json"
             context_path.write_text(json.dumps(context), encoding="utf-8")
-            environment["PATH"] = str(root / ".venv" / "Scripts") + os.pathsep + environment["PATH"]
-            if assigned_worker and assigned_worker.get('exitFirst'):
-                outbox = tmp_path / 'exit-first-envelope.json'
-                helper = Path(__file__).with_name('prepare_exit_first_receipt.cjs')
-                return subprocess.list2cmdline([node, str(helper), cli, str(context_path),
-                    environment['HERMES_TEST_WORKER_ARTIFACT'], str(outbox), sys.executable])
-            return f'"{node}" "{cli}" --context "{context_path}" --artifact "{environment.get("HERMES_TEST_WORKER_ARTIFACT", "worker-evidence.md")}"'
+        environment["PATH"] = str(root / ".venv" / "Scripts") + os.pathsep + environment["PATH"]
+        if assigned_worker and assigned_worker.get('exitFirst'):
+            outbox = tmp_path / 'exit-first-envelope.json'
+            helper = Path(__file__).with_name('prepare_exit_first_receipt.cjs')
+            return subprocess.list2cmdline([node, str(helper), cli, str(context_path),
+                environment['HERMES_TEST_WORKER_ARTIFACT'], str(outbox), sys.executable])
+        return f'"{node}" "{cli}" --context "{context_path}" --artifact "{environment.get("HERMES_TEST_WORKER_ARTIFACT", "worker-evidence.md")}"'
 
     try:
         if assigned_worker and assigned_worker.get('controlMode') in ('cancel', 'pause', 'revise'):
