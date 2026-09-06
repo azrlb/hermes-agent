@@ -67,7 +67,7 @@ def _add_worktree(repo: Path, target: Path, branch: str) -> Path:
     return target
 
 
-@pytest.mark.parametrize("case", ["prepared", "wrong-branch", "missing", "legacy"])
+@pytest.mark.parametrize("case", ["prepared", "wrong-branch", "missing", "legacy", "unpinned", "changed-commit", "dirty-input"])
 def test_controller_requires_exact_prepared_worktree(kanban_home, tmp_path, case):
     repo = _make_repo(tmp_path)
     target = repo / ".worktrees" / "assigned"
@@ -75,24 +75,32 @@ def test_controller_requires_exact_prepared_worktree(kanban_home, tmp_path, case
     if case != "missing":
         _add_worktree(repo, target, expected_branch if case != "wrong-branch" else "codex/other")
         (target / "saved-work.txt").write_text("preserve this", encoding="utf-8")
+    input_commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    if case in ("changed-commit", "dirty-input"):
+        (target / "README.md").write_text("changed after controller preparation\n", encoding="utf-8")
+        if case == "changed-commit":
+            _git(target, "add", "README.md")
+            _git(target, "commit", "-m", "unexpected replacement input")
     metadata = {"controllerRunId": "disposable-controller"}
     if case != "legacy":
-        metadata["preparedWorkspace"] = {"version": 1, "path": str(target), "branch": expected_branch}
+        metadata["preparedWorkspace"] = {"version": 1 if case == "unpinned" else 2, "path": str(target), "branch": expected_branch, "inputCommit": input_commit}
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="controller assignment", body="<!-- codex-bmad-lifecycle " + json.dumps(metadata) + " -->",
                              workspace_kind="worktree", workspace_path=str(target), branch_name=expected_branch)
         task = kb.get_task(conn, tid)
     before = subprocess.check_output(["git", "-C", str(repo), "worktree", "list", "--porcelain"], text=True)
     if case == "prepared":
-        assert kb._resolve_worktree_workspace(task) == (target.resolve(), expected_branch)
+        assert kb._resolve_worktree_workspace(task, verify_input=True) == (target.resolve(), expected_branch)
     else:
         with pytest.raises(ValueError, match="controller.*prepared worktree"):
-            kb._resolve_worktree_workspace(task)
+            kb._resolve_worktree_workspace(task, verify_input=True)
     assert subprocess.check_output(["git", "-C", str(repo), "worktree", "list", "--porcelain"], text=True) == before
     if case != "missing":
         assert (target / "saved-work.txt").read_text(encoding="utf-8") == "preserve this"
     else:
         assert not target.exists()
+    if case in ("changed-commit", "dirty-input"):
+        assert (target / "README.md").read_text(encoding="utf-8") == "changed after controller preparation\n"
 
 
 def test_decompose_worktree_children_get_own_workspace(kanban_home):
@@ -153,6 +161,4 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert head == "wt/sibling"
-
-
 

@@ -8053,7 +8053,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
 
 
 def _resolve_worktree_workspace(
-    task: Task, *, board: Optional[str] = None
+    task: Task, *, board: Optional[str] = None, verify_input: bool = False
 ) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``.
 
@@ -8076,7 +8076,7 @@ def _resolve_worktree_workspace(
                 raise ValueError("ambiguous assignment")
             metadata = json.loads(markers[0].group(1))
             prepared = metadata["preparedWorkspace"]
-            if (prepared.get("version") != 1 or not isinstance(prepared.get("path"), str)
+            if (prepared.get("version") not in (1, 2) or not isinstance(prepared.get("path"), str)
                     or prepared.get("branch") != task.branch_name or not task.workspace_path):
                 raise ValueError("incomplete assignment")
             requested = Path(task.workspace_path)
@@ -8086,8 +8086,26 @@ def _resolve_worktree_workspace(
                     or not _is_linked_worktree_checkout(requested)
                     or _git_current_branch(requested) != task.branch_name):
                 raise ValueError("changed assignment")
+            if verify_input:
+                # A path/branch match does not prove that the model will read
+                # the controller's input. Check at dispatch AND at the shipped
+                # launcher boundary. Legacy/unpinned or changed saved work is
+                # held for explicit recovery; never reset or clean it here.
+                input_commit = prepared.get("inputCommit")
+                if prepared.get("version") != 2 or not isinstance(input_commit, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", input_commit):
+                    raise ValueError("controller input pin requires recovery")
+                git_env = {key: value for key, value in os.environ.items()
+                           if key not in {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"}}
+                git_env["GIT_OPTIONAL_LOCKS"] = "0"
+                git_prefix = ["git", "-c", "core.fsmonitor=false", "-C", str(requested)]
+                head = subprocess.check_output(git_prefix + ["rev-parse", "HEAD"], text=True,
+                                               stderr=subprocess.PIPE, timeout=10, env=git_env).strip()
+                dirty = subprocess.check_output(git_prefix + ["status", "--porcelain", "--untracked-files=no"],
+                                                text=True, stderr=subprocess.PIPE, timeout=10, env=git_env)
+                if head.lower() != input_commit.lower() or dirty.strip():
+                    raise ValueError("prepared input changed; preserve it for recovery")
             return requested.resolve(strict=True), task.branch_name
-        except (ValueError, TypeError, KeyError, AttributeError, OSError) as exc:
+        except (ValueError, TypeError, KeyError, AttributeError, OSError, subprocess.SubprocessError) as exc:
             raise ValueError("controller task requires its exact prepared worktree; hold for recovery") from exc
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
@@ -11067,7 +11085,7 @@ def _dispatch_once_locked(
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board, verify_input=True)
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
@@ -11194,7 +11212,7 @@ def _dispatch_once_locked(
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board, verify_input=True)
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
@@ -11561,6 +11579,10 @@ def _default_spawn(
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
+    if re.search(r"<!--\s*codex-bmad-lifecycle\b", task.body or ""):
+        prepared_path, _ = _resolve_worktree_workspace(task, board=board, verify_input=True)
+        if Path(workspace) != prepared_path:
+            raise ValueError("controller launcher requires its exact prepared worktree")
 
     from hermes_cli.profiles import normalize_profile_name
 
