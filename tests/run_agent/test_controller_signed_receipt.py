@@ -8,6 +8,7 @@ from pathlib import Path
 import runpy
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from urllib.request import Request, urlopen
@@ -191,8 +192,13 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
         else:
             context_path = tmp_path / "receipt-context.json"
             context_path.write_text(json.dumps(context), encoding="utf-8")
-        environment["PATH"] = str(root / ".venv" / "Scripts") + os.pathsep + environment["PATH"]
-        return f'"{node}" "{cli}" --context "{context_path}" --artifact "{environment.get("HERMES_TEST_WORKER_ARTIFACT", "worker-evidence.md")}"'
+            environment["PATH"] = str(root / ".venv" / "Scripts") + os.pathsep + environment["PATH"]
+            if assigned_worker and assigned_worker.get('exitFirst'):
+                outbox = tmp_path / 'exit-first-envelope.json'
+                helper = Path(__file__).with_name('prepare_exit_first_receipt.cjs')
+                return subprocess.list2cmdline([node, str(helper), cli, str(context_path),
+                    environment['HERMES_TEST_WORKER_ARTIFACT'], str(outbox), sys.executable])
+            return f'"{node}" "{cli}" --context "{context_path}" --artifact "{environment.get("HERMES_TEST_WORKER_ARTIFACT", "worker-evidence.md")}"'
 
     try:
         if assigned_worker and assigned_worker.get('controlMode') in ('cancel', 'pause', 'revise'):
@@ -203,6 +209,16 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
             return
         exercise = runpy.run_path(str(Path(__file__).with_name("test_controller_model_boundary.py")))["test_supervised_agent_saves_git_output_and_fresh_observer_certifies_exit"]
         exercise(tmp_path, cli_completion=True, trailing_tool=False, receipt_setup=setup, assigned_worker=assigned_worker)
+        if assigned_worker and assigned_worker.get('exitFirst'):
+            assert received == [] and failures == [], 'receipt reached controller before real exit'
+            envelope = json.loads((tmp_path / 'exit-first-envelope.json').read_text())
+            unsigned = {key: value for key, value in envelope.items() if key != 'signature'}
+            expected = hmac.new(secret.encode(), json.dumps(unsigned, sort_keys=True, separators=(',', ':')).encode(), hashlib.sha256).hexdigest()
+            assert hmac.compare_digest(envelope['signature'], expected)
+            assert envelope['keyId'] == principal and envelope['payload']['receipt']['producer']['dispatchId'] == dispatch_id
+            result = post(setup_url.rsplit('/', 1)[0] + '/exit-first-ready', {'envelope': envelope})
+            assert result['realExitStagedFirst'] is True
+            received.append(envelope['payload']['receipt'])
         assert not failures, failures
         assert len(received) == 1
         receipt = received[0]
