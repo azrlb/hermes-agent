@@ -209,6 +209,45 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
         return f'"{node}" "{cli}" --context "{context_path}" --artifact "{environment.get("HERMES_TEST_WORKER_ARTIFACT", "worker-evidence.md")}"'
 
     try:
+        if assigned_worker and assigned_worker.get('inputMutation'):
+            from hermes_cli import kanban_db as kb
+            from hermes_cli.profiles import get_profile_dir
+            workspace = Path(assigned_worker['worktreePath'])
+            changed = workspace / 'package.json'
+            saved_content = changed.read_text(encoding='utf-8') + '\n'
+            changed.write_text(saved_content, encoding='utf-8')
+            if assigned_worker['inputMutation'] == 'commit':
+                subprocess.run(['git', '-C', str(workspace), 'add', 'package.json'], check=True)
+                subprocess.run(['git', '-C', str(workspace), '-c', 'user.name=Fixture', '-c', 'user.email=test@example.invalid',
+                                'commit', '-qm', 'changed after gateway assignment'], check=True)
+            changed_head = subprocess.check_output(['git', '-C', str(workspace), 'rev-parse', 'HEAD'], text=True).strip()
+            launches = []
+
+            def forbidden_launch(*args, **kwargs):
+                launches.append(True)
+                raise AssertionError('changed input reached the worker launcher')
+
+            with kb.connect_closing(board='probe') as conn:
+                task = kb.get_task(conn, assigned_worker['hermesTaskId'])
+                profile = get_profile_dir(task.assignee)
+                assert profile.is_relative_to(Path(os.environ['HERMES_HOME']))
+                profile.mkdir(parents=True, exist_ok=True)
+                result = kb.dispatch_once(conn, board='probe', max_spawn=1, spawn_fn=forbidden_launch)
+                assert result.spawned == [] and launches == []
+            with kb.connect_closing(board='probe') as conn:
+                failed = conn.execute('SELECT worker_pid, claim_lock, consecutive_failures, last_failure_error FROM tasks WHERE id=?',
+                                      (task.id,)).fetchone()
+                assert failed['worker_pid'] is None and failed['claim_lock'] is None
+                assert failed['consecutive_failures'] == 1
+                assert 'exact prepared worktree' in failed['last_failure_error']
+            assert changed.read_text(encoding='utf-8') == saved_content
+            assert subprocess.check_output(['git', '-C', str(workspace), 'rev-parse', 'HEAD'], text=True).strip() == changed_head
+            result = post(setup_url.rsplit('/', 1)[0] + '/input-blocked', {})
+            assert result == {'held': True, 'acceptedReceiptIds': []}
+            assert received == [] and failures == []
+            dispose_failed_fixture()
+            completed = True
+            return
         if assigned_worker and assigned_worker.get('controlMode') in ('cancel', 'pause', 'revise'):
             exercise_busy = runpy.run_path(str(Path(__file__).with_name('controller_busy_worker_fixture.py')))['exercise_busy_worker_cancel']
             exercise_busy(assigned_worker, setup_url.rsplit('/', 1)[0] + '/control', post)
