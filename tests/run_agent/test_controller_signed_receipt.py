@@ -80,7 +80,11 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
                     assert hmac.compare_digest(signature, expected)
                     payload = envelope["payload"]
                     assert self.headers["Idempotency-Key"] == hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
-                    assert payload["type"] == "receipt" and payload["sequence"] == 1
+                    # Recovery consumes an operator event before this worker.
+                    # Validate its exact immutable dispatch sequence, not an
+                    # assumed first event or whatever the current state says.
+                    assert payload["type"] == "receipt"
+                    assert payload["sequence"] == upstream.get("eventSequence", 1)
                     receipt = payload["receipt"]
                     assert receipt["runId"] == run_id
                     assert receipt["producer"]["dispatchId"] == dispatch_id
@@ -164,7 +168,8 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
             if assigned_worker:
                 supplied = assigned_worker
                 assert tid == supplied['hermesTaskId']
-            upstream.update(stateUrl=supplied.get('nativeStateUrl', supplied['stateUrl']), submitUrl=supplied.get('nativeSubmitUrl', supplied['submitUrl']))
+            upstream.update(stateUrl=supplied.get('nativeStateUrl', supplied['stateUrl']), submitUrl=supplied.get('nativeSubmitUrl', supplied['submitUrl']),
+                            eventSequence=supplied['request']['eventSequence'])
             context.update(supplied)
             context.update(stateUrl=base + "/state", submitUrl=base + "/submit", secretFile=str(key))
             principal = context["principalId"]
