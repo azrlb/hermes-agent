@@ -20,7 +20,7 @@ def test_controlled_model_writes_real_worker_evidence(tmp_path, monkeypatch):
     _run_controlled_model(tmp_path, monkeypatch)
 
 
-def _run_controlled_model(tmp_path, monkeypatch, *, kanban_worker=False, cli_completion=False, trailing_tool=False):
+def _run_controlled_model(tmp_path, monkeypatch, *, kanban_worker=False, cli_completion=False, trailing_tool=False, receipt_command=""):
     original_connect = socket.socket.connect
 
     def refuse_network(sock, address):
@@ -50,15 +50,19 @@ def _run_controlled_model(tmp_path, monkeypatch, *, kanban_worker=False, cli_com
                 name="write_file", arguments=json.dumps({"path": str(artifact), "content": "verified fixture output\n"})))]
             content = None
         elif kanban_worker:
-            assert len(calls) <= 4, "unexpected model retry"
+            assert len(calls) <= (5 if receipt_command else 4), "unexpected model retry"
             assert artifact.read_text(encoding="utf-8") == "verified fixture output\n"
             if len(calls) == 2:
                 name, args = "terminal", {"command": "git add worker-evidence.md"}
             elif len(calls) == 3:
                 name, args = "terminal", {"command": 'git -c user.name="Worker Test" -c user.email=test@example.invalid commit -qm "worker evidence"'}
+            elif receipt_command and len(calls) == 4:
+                name, args = "terminal", {"command": "git push origin HEAD"}
             else:
                 assert subprocess.check_output(['git', '-C', str(tmp_path), 'show', 'HEAD:worker-evidence.md'], text=True) == 'verified fixture output\n'
-                if cli_completion:
+                if receipt_command:
+                    name, args = "terminal", {"command": receipt_command}
+                elif cli_completion:
                     name, args = "terminal", {"command": f'"{sys.executable}" -m hermes_cli.main kanban --board probe complete {os.environ["HERMES_KANBAN_TASK"]} --summary "Evidence saved in Git."'}
                 else:
                     name, args = "kanban_complete", {"summary": "Evidence saved in Git."}
@@ -88,7 +92,7 @@ def _run_controlled_model(tmp_path, monkeypatch, *, kanban_worker=False, cli_com
         assert result["turn_exit_reason"] == "kanban_terminal_succeeded", result
     else:
         assert result["final_response"] == "Evidence saved."
-    assert len(calls) == (4 if kanban_worker else 2)
+    assert len(calls) == (5 if receipt_command else 4 if kanban_worker else 2)
     assert artifact.read_text(encoding="utf-8") == "verified fixture output\n"
     assert not (tmp_path / "forbidden.md").exists()
     if trailing_tool:
@@ -101,7 +105,7 @@ def _run_controlled_model(tmp_path, monkeypatch, *, kanban_worker=False, cli_com
 @pytest.mark.windows_only
 @pytest.mark.parametrize("cli_completion", [False, True], ids=["model-tool", "receipt-cli-path"])
 @pytest.mark.parametrize("trailing_tool", [False, True], ids=["single", "trailing-write"])
-def test_supervised_agent_saves_git_output_and_fresh_observer_certifies_exit(tmp_path, cli_completion, trailing_tool):
+def test_supervised_agent_saves_git_output_and_fresh_observer_certifies_exit(tmp_path, cli_completion, trailing_tool, receipt_setup=None):
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_worker_job import prepare_worker_command
 
@@ -116,18 +120,19 @@ def test_supervised_agent_saves_git_output_and_fresh_observer_certifies_exit(tmp
         run_id = task.current_run_id
         environment.update(HERMES_KANBAN_TASK=tid, HERMES_KANBAN_RUN_ID=str(run_id),
                            HERMES_KANBAN_EXIT_RECORD=str(kb._worker_exit_record_path(tid, run_id, board="probe")))
+        receipt_command = receipt_setup(tid, run_id, workspace, environment) if receipt_setup else ""
         code = """
 import runpy, sys
 from pathlib import Path
 import pytest
 from hermes_cli import kanban_db as kb
 with pytest.MonkeyPatch.context() as isolated:
-    runpy.run_path(sys.argv[1])['_run_controlled_model'](Path(sys.argv[2]), isolated, kanban_worker=True, cli_completion=sys.argv[3] == 'True', trailing_tool=sys.argv[4] == 'True')
+    runpy.run_path(sys.argv[1])['_run_controlled_model'](Path(sys.argv[2]), isolated, kanban_worker=True, cli_completion=sys.argv[3] == 'True', trailing_tool=sys.argv[4] == 'True', receipt_command=sys.argv[5])
 print('WORKER_ASSERTIONS_PASSED', flush=True)
 kb.write_kanban_worker_exit_record(0)
 """
         command = prepare_worker_command(conn, tid, run_id,
-                                         [sys.executable, "-u", "-c", code, str(Path(__file__).resolve()), str(workspace), str(cli_completion), str(trailing_tool)])
+                                         [sys.executable, "-u", "-c", code, str(Path(__file__).resolve()), str(workspace), str(cli_completion), str(trailing_tool), receipt_command])
         worker = subprocess.Popen(command, cwd=root, env=environment, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
         kb._set_worker_pid(conn, tid, worker.pid)
