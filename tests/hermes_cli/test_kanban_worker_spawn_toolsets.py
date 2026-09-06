@@ -4,24 +4,22 @@ import subprocess
 
 
 def _make_task(kb, *, assignee: str):
-    return kb.Task(
-        id="t_spawn_tools",
-        title="spawn tools",
-        body=None,
-        assignee=assignee,
-        status="running",
-        priority=0,
-        created_by="test",
-        created_at=1,
-        started_at=None,
-        completed_at=None,
-        workspace_kind="dir",
-        workspace_path=None,
-        claim_lock="lock",
-        claim_expires=None,
-        tenant=None,
-        current_run_id=7,
-    )
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="spawn tools", assignee=assignee)
+        return kb.claim_task(conn, task_id)
+
+
+def _worker_argv(kb, task, command):
+    if not kb._IS_WINDOWS:
+        return command
+    # Windows launches the command inside an exact-run job supervisor. Keep
+    # that real binding in this argv test rather than bypassing its guard.
+    with kb.connect_closing() as conn:
+        job_name = conn.execute("SELECT worker_job_name FROM task_runs WHERE id = ? AND task_id = ?",
+                                (task.current_run_id, task.id)).fetchone()[0]
+    assert command[3:6] == [task.id, str(task.current_run_id), job_name]
+    assert job_name
+    return command[6:]
 
 
 def test_default_spawn_pins_assignee_profile_cli_toolsets(monkeypatch, tmp_path):
@@ -78,13 +76,15 @@ agent:
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    pid = kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+    task = _make_task(kb, assignee="elias")
+    pid = kb._default_spawn(task, str(workspace))
+    worker_command = _worker_argv(kb, task, captured["cmd"])
 
     assert pid == 4242
     assert captured["env"]["HERMES_HOME"] == str(profile)
-    assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
-    assert "--toolsets" in captured["cmd"]
-    pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
+    assert captured["env"]["HERMES_KANBAN_TASK"] == task.id
+    assert "--toolsets" in worker_command
+    pinned = worker_command[worker_command.index("--toolsets") + 1].split(",")
     for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):
         assert required in pinned
 
@@ -121,17 +121,18 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     task = _make_task(kb, assignee="elias")
     task.model_override = "gpt-5.6-sol"
     kb._default_spawn(task, str(workspace))
+    worker_command = _worker_argv(kb, task, captured["cmd"])
 
     parser, _subparsers, _chat_parser = build_top_level_parser()
     # Profile selection is attached by the outer CLI bootstrap rather than
     # build_top_level_parser(); remove that already-validated prefix and parse
     # the worker flags/subcommand through the real shared parser.
-    assert captured["cmd"][1:3] == ["-p", "elias"]
-    args = parser.parse_args(captured["cmd"][3:])
+    assert worker_command[1:3] == ["-p", "elias"]
+    args = parser.parse_args(worker_command[3:])
 
     assert args.command == "chat"
     assert args.model == "gpt-5.6-sol"
-    assert args.query == "work kanban task t_spawn_tools"
+    assert args.query == f"work kanban task {task.id}"
 
 
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):

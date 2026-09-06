@@ -146,10 +146,33 @@ kb.write_kanban_worker_exit_record(0)
             environment.update(HERMES_KANBAN_TASK=tid, HERMES_KANBAN_RUN_ID=str(run_id),
                                HERMES_KANBAN_EXIT_RECORD=str(kb._worker_exit_record_path(tid, run_id, board=board)))
             receipt_command = receipt_setup(tid, run_id, workspace, environment) if receipt_setup else ""
-            command = prepare_worker_command(conn, tid, run_id,
-                                             [sys.executable, "-u", "-c", code, str(Path(__file__).resolve()), str(workspace), str(cli_completion), str(trailing_tool), receipt_command])
-            worker = subprocess.Popen(command, cwd=root, env=environment, stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            if assigned_worker:
+                # Use the shipped launcher, including profile switching, board
+                # pins, logging and supervision. Substitute only the executable
+                # payload so no paid or uncontrolled model can be started.
+                startup_assertions = """
+import os
+from pathlib import Path
+assert Path.cwd() == Path(os.environ['HERMES_KANBAN_WORKSPACE'])
+assert Path(os.environ['TERMINAL_CWD']) == Path.cwd()
+assert Path(os.environ['HERMES_HOME']).name == os.environ['HERMES_PROFILE']
+assert os.environ['HERMES_KANBAN_BOARD'] == 'probe'
+assert Path(os.environ['HERMES_KANBAN_DB']).is_file()
+"""
+                payload = [sys.executable, "-u", "-c", startup_assertions + code,
+                           str(Path(__file__).resolve()), str(workspace),
+                           str(cli_completion), str(trailing_tool), receipt_command]
+                with pytest.MonkeyPatch.context() as launch_patch:
+                    for key, value in environment.items():
+                        launch_patch.setenv(key, value)
+                    launch_patch.setattr(kb, "_resolve_hermes_argv", lambda: payload)
+                    pid = kb._default_spawn(task, workspace_path, board=board)
+                    worker = kb._worker_processes[pid]
+            else:
+                command = prepare_worker_command(conn, tid, run_id,
+                                                 [sys.executable, "-u", "-c", code, str(Path(__file__).resolve()), str(workspace), str(cli_completion), str(trailing_tool), receipt_command])
+                worker = subprocess.Popen(command, cwd=root, env=environment, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
             return worker.pid
 
         try:
@@ -170,6 +193,8 @@ kb.write_kanban_worker_exit_record(0)
                 kb._set_worker_pid(conn, tid, launch_controlled_model(task, str(workspace), board="probe"))
             assert worker is not None
             stdout, stderr = worker.communicate(timeout=75)
+            if assigned_worker:
+                stdout = (kb.worker_logs_dir(board="probe") / f"{tid}.log").read_text(encoding="utf-8")
             assert worker.returncode == 0, (stdout, stderr)
             assert 'WORKER_ASSERTIONS_PASSED' in stdout, (stdout, stderr)
         finally:
