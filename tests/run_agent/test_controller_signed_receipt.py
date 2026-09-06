@@ -30,7 +30,7 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
     root = Path(__file__).resolve().parents[2]
     principal, secret = "hermes-technical-acceptor-v1", "disposable-receipt-secret"
     run_id, dispatch_id = "my244-signed-worker-fixture", "a" * 64
-    received, failures = [], []
+    received, failures, received_events = [], [], []
     upstream = {}
     active_task_id = None
     setup_url = os.environ.get("HERMES_TEST_CONTROLLER_SETUP_URL")
@@ -85,9 +85,10 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
                     # Recovery consumes an operator event before this worker.
                     # Validate its exact immutable dispatch sequence, not an
                     # assumed first event or whatever the current state says.
-                    assert payload["type"] == "receipt"
+                    repeated = bool(assigned_worker and assigned_worker.get('repeatedFailure'))
+                    assert payload["type"] in ('receipt', 'worker-failed', 'failure') if repeated else payload["type"] == 'receipt'
                     assert payload["sequence"] == upstream.get("eventSequence", 1)
-                    receipt = payload["receipt"]
+                    receipt = payload["receipt"] if payload['type'] == 'receipt' else payload
                     assert receipt["runId"] == run_id
                     assert receipt["producer"]["dispatchId"] == dispatch_id
                     assert receipt["producer"]["principalId"] == principal
@@ -95,7 +96,9 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
                     with kb.connect_closing(board="probe") as conn:
                         task = kb.get_task(conn, active_task_id)
                         assert task.status == "running" and task.current_run_id is not None
-                    received.append(receipt)
+                    received_events.append(payload)
+                    if payload['type'] == 'receipt':
+                        received.append(receipt)
                     response = post(upstream["submitUrl"], json.loads(body)) if upstream else {"staged": True}
                 else:
                     raise AssertionError("unexpected receiver endpoint")
@@ -184,7 +187,7 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
             principal = context["principalId"]
             run_id, dispatch_id = context["request"]["runId"], context["request"]["dispatchId"]
             environment["HERMES_TEST_WORKER_ARTIFACT"] = f"_bmad-output/orchestrator-runs/{run_id}/worker-evidence.md"
-            if assigned_worker and assigned_worker.get('repairReview'):
+            if assigned_worker and (assigned_worker.get('repairReview') or assigned_worker.get('repeatedFailure')):
                 # Each real worker saves separate Git evidence; the reviewer
                 # must not produce an empty commit by rewriting the repair file.
                 environment["HERMES_TEST_WORKER_ARTIFACT"] = f"_bmad-output/orchestrator-runs/{run_id}/e{supplied['request']['eventSequence']}.md"
@@ -206,9 +209,39 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
             arguments = [node, str(helper), cli, str(context_path),
                 environment['HERMES_TEST_WORKER_ARTIFACT'], str(outbox), sys.executable]
             return ' '.join(json.dumps(argument.replace('\\', '/')) for argument in arguments)
-        return f'"{node}" "{cli}" --context "{context_path}" --artifact "{environment.get("HERMES_TEST_WORKER_ARTIFACT", "worker-evidence.md")}"'
+        command = f'"{node}" "{cli}" --context "{context_path}" --artifact "{environment.get("HERMES_TEST_WORKER_ARTIFACT", "worker-evidence.md")}"'
+        if assigned_worker and assigned_worker.get('repeatedFailure'):
+            repair = supplied['request']['decision'] == 'escalate' and supplied['request']['reasons'][0] == 'bounded-repair'
+            if not repair:
+                command += ' --status failed --finding "repeatable disposable defect" --classification "repeatable disposable defect"'
+        return command
 
     try:
+        if assigned_worker and assigned_worker.get('repeatedFailure'):
+            exercise = runpy.run_path(str(Path(__file__).with_name("test_controller_model_boundary.py")))["test_supervised_agent_saves_git_output_and_fresh_observer_certifies_exit"]
+            endpoint = setup_url.rsplit('/', 1)[0] + '/next-failure'
+            seen_dispatches = set()
+            for attempt in range(8):
+                assert assigned_worker['request']['dispatchId'] not in seen_dispatches
+                seen_dispatches.add(assigned_worker['request']['dispatchId'])
+                exercise(tmp_path, cli_completion=True, trailing_tool=False, receipt_setup=setup, assigned_worker=assigned_worker)
+                assert failures == [] and len(received_events) == attempt + 1, failures
+                result = post(endpoint, {'completedDispatchId': assigned_worker['request']['dispatchId']})
+                deadline = time.monotonic() + 90
+                while result.get('pending') and time.monotonic() < deadline:
+                    time.sleep(0.25)
+                    result = post(endpoint, {'completedDispatchId': assigned_worker['request']['dispatchId']})
+                if result.get('held'):
+                    assert attempt == 7 and len(received) == 2
+                    assert [event['type'] for event in received_events] == [
+                        'worker-failed', 'failure', 'receipt', 'worker-failed',
+                        'failure', 'receipt', 'worker-failed', 'failure']
+                    assert result['classifications'] == 3 and result['dispatches'] == 8
+                    completed = True
+                    return
+                assert 'assignment' in result, result
+                assigned_worker = result['assignment']
+            raise AssertionError('same-cause limit did not stop after three real classifications')
         if assigned_worker and assigned_worker.get('inputMutation'):
             from hermes_cli import kanban_db as kb
             from hermes_cli.profiles import get_profile_dir
