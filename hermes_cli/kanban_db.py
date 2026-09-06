@@ -5349,6 +5349,14 @@ def stop_task(
             return {"stopped": False, "reason": "process_tree_exit_unverified", **termination}
     elif windows_stop and (row["worker_pid"] or row["claim_lock"]):
         return {"stopped": False, "reason": "process_tree_identity_missing"}
+    elif (run is None and row["current_run_id"] is None
+          and row["worker_pid"] is None and row["claim_lock"] is None
+          and row["status"] in ("triage", "todo", "scheduled", "ready")):
+        # No attempt has ever existed. Do not demand a process-exit record
+        # for a process that was never launched. The update below still checks
+        # both ownership and latest-run identity against a concurrent claim.
+        termination = {"never_started": True, "termination_attempted": False,
+                       "terminated": False, "host_local": True, "prev_pid": None}
     elif terminal:
         return {"stopped": True, "status": row["status"], "already_terminal": True}
     else:

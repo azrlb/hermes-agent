@@ -18,7 +18,7 @@ import pytest
 
 
 @pytest.mark.windows_only
-def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_path, tmp_path_factory):
+def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_path, tmp_path_factory, request):
     cli = os.environ.get("HERMES_TEST_CONTROLLER_RECEIPT_CLI")
     if not cli:
         pytest.skip("requires the compiled controller candidate HERMES_TEST_CONTROLLER_RECEIPT_CLI")
@@ -32,6 +32,19 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
     upstream = {}
     active_task_id = None
     setup_url = os.environ.get("HERMES_TEST_CONTROLLER_SETUP_URL")
+    completed = False
+    def dispose_failed_fixture():
+        if completed or not setup_url:
+            return
+        endpoint = setup_url.rsplit('/', 1)[0] + '/dispose'
+        result = post(endpoint, {})
+        deadline = time.monotonic() + 90
+        while result['status'] == 'pending' and time.monotonic() < deadline:
+            time.sleep(0.25)
+            result = post(endpoint + '-result', {})
+        assert result['status'] == 'verified', result
+    # Runs before tmp_path/environment teardown, including setup exceptions.
+    request.addfinalizer(dispose_failed_fixture)
     if setup_url:
         assert urlparse(setup_url).hostname == "127.0.0.1", "controller harness must be disposable loopback"
         if setup_url.endswith('/assignment'):
@@ -174,6 +187,7 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
             exercise_busy = runpy.run_path(str(Path(__file__).with_name('controller_busy_worker_fixture.py')))['exercise_busy_worker_cancel']
             exercise_busy(assigned_worker, setup_url.rsplit('/', 1)[0] + '/control', post)
             assert received == [] and failures == []
+            completed = True
             return
         exercise = runpy.run_path(str(Path(__file__).with_name("test_controller_model_boundary.py")))["test_supervised_agent_saves_git_output_and_fresh_observer_certifies_exit"]
         exercise(tmp_path, cli_completion=True, trailing_tool=False, receipt_setup=setup, assigned_worker=assigned_worker)
@@ -189,6 +203,7 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
             # Keep the disposable board and Git remote alive until the real
             # controller has independently consumed both pieces of evidence.
             post(setup_url.rsplit("/", 1)[0] + "/finish", {"receiptId": receipt["receiptId"]})
+        completed = True
     finally:
         server.shutdown()
         server.server_close()

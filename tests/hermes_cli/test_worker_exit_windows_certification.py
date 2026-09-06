@@ -15,6 +15,33 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+@pytest.mark.windows_only
+@pytest.mark.parametrize("concurrent_claim", [False, True])
+def test_stop_never_started_task_without_inventing_an_exit(monkeypatch, concurrent_claim):
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="disposable never-started stop", assignee="probe")
+        assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0] == 0
+        if concurrent_claim:
+            survived = kb._worker_survived_termination
+            def claim_before_stop_update(termination):
+                assert kb.claim_task(conn, tid)
+                return survived(termination)
+            monkeypatch.setattr(kb, "_worker_survived_termination", claim_before_stop_update)
+        result = kb.stop_task(conn, tid, reason="cancel before pickup")
+        if concurrent_claim:
+            assert result == {"stopped": False, "reason": "ownership_changed"}
+            task = kb.get_task(conn, tid)
+            assert task.status == "running" and task.claim_lock is not None
+            assert task.current_run_id is not None
+            return
+        assert result["stopped"] is True
+        assert result["never_started"] is True
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0] == 0
+        assert kb.stop_task(conn, tid, reason="repeat cancellation")["stopped"] is True
+
+
 def _dashboard_status_writer(root):
     spec = importlib.util.spec_from_file_location(
         "my244_windows_dashboard", root / "plugins/kanban/dashboard/plugin_api.py",
