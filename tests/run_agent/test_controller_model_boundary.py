@@ -35,7 +35,8 @@ def _run_controlled_model(tmp_path, monkeypatch, *, kanban_worker=False, cli_com
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
     monkeypatch.chdir(tmp_path)
-    artifact = tmp_path / "worker-evidence.md"
+    artifact_relative = os.environ.get("HERMES_TEST_WORKER_ARTIFACT", "worker-evidence.md")
+    artifact = tmp_path / artifact_relative
     agent = AIAgent(model="test-model", api_key="disposable-test-key",
                     base_url="http://127.0.0.1:1/v1", enabled_toolsets=["file", "terminal", "kanban"] if kanban_worker else ["file"],
                     max_iterations=6, quiet_mode=True, skip_context_files=True,
@@ -53,13 +54,13 @@ def _run_controlled_model(tmp_path, monkeypatch, *, kanban_worker=False, cli_com
             assert len(calls) <= (5 if receipt_command else 4), "unexpected model retry"
             assert artifact.read_text(encoding="utf-8") == "verified fixture output\n"
             if len(calls) == 2:
-                name, args = "terminal", {"command": "git add worker-evidence.md"}
+                name, args = "terminal", {"command": f'git add "{artifact_relative}"'}
             elif len(calls) == 3:
                 name, args = "terminal", {"command": 'git -c user.name="Worker Test" -c user.email=test@example.invalid commit -qm "worker evidence"'}
             elif receipt_command and len(calls) == 4:
                 name, args = "terminal", {"command": "git push origin HEAD"}
             else:
-                assert subprocess.check_output(['git', '-C', str(tmp_path), 'show', 'HEAD:worker-evidence.md'], text=True) == 'verified fixture output\n'
+                assert subprocess.check_output(['git', '-C', str(tmp_path), 'show', f'HEAD:{artifact_relative}'], text=True) == 'verified fixture output\n'
                 if receipt_command:
                     name, args = "terminal", {"command": receipt_command}
                 elif cli_completion:
@@ -159,4 +160,4 @@ with kb.connect_closing(board='probe') as conn:
     assert observed['worker_exit_kind'] == 'clean_exit'
     assert observed['worker_pid'] == worker.pid
     assert observed['worker_exited_at'] >= observed['process_started_at']
-    assert subprocess.check_output(['git', '-C', str(workspace), 'show', 'HEAD:worker-evidence.md'], text=True) == 'verified fixture output\n'
+    assert subprocess.check_output(['git', '-C', str(workspace), 'show', 'HEAD:' + environment.get('HERMES_TEST_WORKER_ARTIFACT', 'worker-evidence.md')], text=True) == 'verified fixture output\n'

@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import threading
 import time
+from urllib.request import Request, urlopen
+from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -27,6 +29,15 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
     principal, secret = "hermes-technical-acceptor-v1", "disposable-receipt-secret"
     run_id, dispatch_id = "my244-signed-worker-fixture", "a" * 64
     received, failures = [], []
+    upstream = {}
+    setup_url = os.environ.get("HERMES_TEST_CONTROLLER_SETUP_URL")
+    if setup_url:
+        assert urlparse(setup_url).hostname == "127.0.0.1", "controller harness must be disposable loopback"
+
+    def post(url, payload):
+        request = Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+        with urlopen(request, timeout=30) as response:
+            return json.load(response)
 
     class Receiver(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -36,8 +47,9 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
             body = self.rfile.read(int(self.headers["Content-Length"]))
             try:
                 if self.path == "/state":
-                    response = {"request": {"runId": run_id}, "expectedEventSequence": 1,
-                                "acceptedReceiptIds": [], "recoveryGeneration": 0}
+                    response = post(upstream["stateUrl"], {}) if upstream else {
+                        "request": {"runId": run_id}, "expectedEventSequence": 1,
+                        "acceptedReceiptIds": [], "recoveryGeneration": 0}
                 elif self.path == "/submit":
                     envelope = json.loads(body)
                     signature = envelope.pop("signature")
@@ -60,7 +72,7 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
                         task = kb.get_task(conn, receipt["producer"]["workerId"])
                         assert task.status == "running" and task.current_run_id is not None
                     received.append(receipt)
-                    response = {"staged": True}
+                    response = post(upstream["submitUrl"], json.loads(body)) if upstream else {"staged": True}
                 else:
                     raise AssertionError("unexpected receiver endpoint")
                 encoded = json.dumps(response).encode()
@@ -79,6 +91,7 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
     thread.start()
 
     def setup(tid, attempt, workspace, environment):
+        nonlocal principal, run_id, dispatch_id
         remote = tmp_path / "origin.git"
         subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
         subprocess.run(["git", "-C", str(workspace), "checkout", "-qb", "codex/signed-fixture"], check=True)
@@ -93,10 +106,24 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
             "principalId": principal, "role": "technical-acceptor", "workerId": tid,
             "expectedBranch": "codex/signed-fixture", "secretFile": str(key),
             "stateUrl": base + "/state", "submitUrl": base + "/submit", "hermesTaskId": tid, "hermesBoard": "probe"}
+        if setup_url:
+            seed = workspace / "seed.md"
+            seed.write_text("disposable initial state\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(workspace), "add", "seed.md"], check=True)
+            subprocess.run(["git", "-C", str(workspace), "-c", "user.name=Fixture", "-c", "user.email=test@example.invalid", "commit", "-qm", "initial fixture"], check=True)
+            commit = subprocess.check_output(["git", "-C", str(workspace), "rev-parse", "HEAD"], text=True).strip()
+            supplied = post(setup_url, {"taskId": tid, "attempt": attempt, "workspace": str(workspace),
+                "home": environment["HERMES_HOME"], "origin": str(remote), "baseCommit": commit})
+            upstream.update(stateUrl=supplied["stateUrl"], submitUrl=supplied["submitUrl"])
+            context.update(supplied)
+            context.update(stateUrl=base + "/state", submitUrl=base + "/submit", secretFile=str(key))
+            principal = context["principalId"]
+            run_id, dispatch_id = context["request"]["runId"], context["request"]["dispatchId"]
+            environment["HERMES_TEST_WORKER_ARTIFACT"] = f"_bmad-output/orchestrator-runs/{run_id}/worker-evidence.md"
         context_path = tmp_path / "receipt-context.json"
         context_path.write_text(json.dumps(context), encoding="utf-8")
         environment["PATH"] = str(root / ".venv" / "Scripts") + os.pathsep + environment["PATH"]
-        return f'"{node}" "{cli}" --context "{context_path}" --artifact worker-evidence.md'
+        return f'"{node}" "{cli}" --context "{context_path}" --artifact "{environment.get("HERMES_TEST_WORKER_ARTIFACT", "worker-evidence.md")}"'
 
     try:
         exercise = runpy.run_path(str(Path(__file__).with_name("test_controller_model_boundary.py")))["test_supervised_agent_saves_git_output_and_fresh_observer_certifies_exit"]
@@ -104,10 +131,15 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
         assert not failures, failures
         assert len(received) == 1
         receipt = received[0]
-        blob = subprocess.check_output(["git", "--git-dir", str(tmp_path / "origin.git"), "show", f'{receipt["source"]["commit"]}:worker-evidence.md'])
+        artifact_path = receipt["artifacts"][0]["uri"].split('/blob/' + receipt["source"]["commit"] + '/', 1)[1]
+        blob = subprocess.check_output(["git", "--git-dir", str(tmp_path / "origin.git"), "show", f'{receipt["source"]["commit"]}:{artifact_path}'])
         assert blob == b"verified fixture output\n"
         assert receipt["artifacts"][0]["sha256"] == hashlib.sha256(blob).hexdigest()
         assert receipt["checks"][0]["sha256"] == hashlib.sha256(blob).hexdigest()
+        if setup_url:
+            # Keep the disposable board and Git remote alive until the real
+            # controller has independently consumed both pieces of evidence.
+            post(setup_url.rsplit("/", 1)[0] + "/finish", {"receiptId": receipt["receiptId"]})
     finally:
         server.shutdown()
         server.server_close()
