@@ -56,8 +56,18 @@ while True:
             child = json.loads(ready.read_text())
             assert psutil.Process(child['pid']).create_time() == child['started']
             before = heartbeat.read_text()
-            time.sleep(0.15)
-            assert heartbeat.read_text() != before, 'child must be actively writing before cancellation'
+            # Prove progress from the same child, not an assumed 150ms scheduler
+            # timeslice. A paused/dead child still fails within this bound.
+            activity_deadline = time.monotonic() + 5
+            while time.monotonic() < activity_deadline:
+                assert worker.poll() is None, 'worker exited before cancellation'
+                assert psutil.Process(child['pid']).create_time() == child['started']
+                observed = heartbeat.read_text()
+                if observed and observed != before:
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError('child did not demonstrate active writing before cancellation')
             mode = assignment['controlMode']
             assert post(control_url, {'taskId': task_id, 'attempt': attempt})['status'] == ('cancelled' if mode == 'cancel' else 'held')
             assert worker.wait(timeout=15) != 0

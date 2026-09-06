@@ -164,6 +164,13 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
             commit = subprocess.check_output(["git", "-C", str(workspace), "rev-parse", "HEAD"], text=True).strip()
             supplied = post(setup_url, {"taskId": tid, "attempt": attempt, "workspace": str(workspace),
                 "home": environment["HERMES_HOME"], "origin": str(remote), "baseCommit": commit})
+            if supplied.get('pending'):
+                deadline = time.monotonic() + 90
+                while supplied.get('pending') and time.monotonic() < deadline:
+                    time.sleep(0.25)
+                    supplied = post(setup_url + '-result', {})
+                assert 'assignment' in supplied, 'the same controller setup operation did not finish'
+                supplied = supplied['assignment']
         if setup_url:
             if assigned_worker:
                 supplied = assigned_worker
