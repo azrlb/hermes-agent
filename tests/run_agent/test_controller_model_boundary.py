@@ -106,17 +106,24 @@ def _run_controlled_model(tmp_path, monkeypatch, *, kanban_worker=False, cli_com
 @pytest.mark.windows_only
 @pytest.mark.parametrize("cli_completion", [False, True], ids=["model-tool", "receipt-cli-path"])
 @pytest.mark.parametrize("trailing_tool", [False, True], ids=["single", "trailing-write"])
-def test_supervised_agent_saves_git_output_and_fresh_observer_certifies_exit(tmp_path, cli_completion, trailing_tool, receipt_setup=None):
+def test_supervised_agent_saves_git_output_and_fresh_observer_certifies_exit(tmp_path, cli_completion, trailing_tool, receipt_setup=None, assigned_worker=None):
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_worker_job import prepare_worker_command
 
     root = Path(__file__).resolve().parents[2]
-    workspace = tmp_path / "worker"
-    workspace.mkdir()
-    subprocess.run(["git", "init", "-q", str(workspace)], check=True, capture_output=True)
+    workspace = Path(assigned_worker["worktreePath"]) if assigned_worker else tmp_path / "worker"
+    if not assigned_worker:
+        workspace.mkdir()
+        subprocess.run(["git", "init", "-q", str(workspace)], check=True, capture_output=True)
     environment = dict(os.environ, PYTHONPATH=str(root), HERMES_KANBAN_BOARD="probe")
     with kb.connect_closing(board="probe") as conn:
-        tid = kb.create_task(conn, title="controlled agent process", assignee="probe", workspace_kind="dir", workspace_path=str(workspace))
+        tid = assigned_worker["hermesTaskId"] if assigned_worker else kb.create_task(conn, title="controlled agent process", assignee="probe", workspace_kind="dir", workspace_path=str(workspace))
+        if assigned_worker:
+            assigned = kb.get_task(conn, tid)
+            assert assigned.status == "ready" and assigned.current_run_id is None
+            resolved, branch = kb._resolve_worktree_workspace(assigned, board="probe")
+            assert Path(resolved) == workspace
+            assert branch == assigned_worker["expectedBranch"]
         task = kb.claim_task(conn, tid)
         run_id = task.current_run_id
         environment.update(HERMES_KANBAN_TASK=tid, HERMES_KANBAN_RUN_ID=str(run_id),

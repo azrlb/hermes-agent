@@ -18,7 +18,7 @@ import pytest
 
 
 @pytest.mark.windows_only
-def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_path):
+def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_path, tmp_path_factory):
     cli = os.environ.get("HERMES_TEST_CONTROLLER_RECEIPT_CLI")
     if not cli:
         pytest.skip("requires the compiled controller candidate HERMES_TEST_CONTROLLER_RECEIPT_CLI")
@@ -33,6 +33,10 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
     setup_url = os.environ.get("HERMES_TEST_CONTROLLER_SETUP_URL")
     if setup_url:
         assert urlparse(setup_url).hostname == "127.0.0.1", "controller harness must be disposable loopback"
+        if setup_url.endswith('/assignment'):
+            # The real linked checkout nests both Git metadata and receipt
+            # artifacts. Keep the disposable root short on Windows.
+            tmp_path = tmp_path_factory.mktemp('g')
 
     def post(url, payload):
         request = Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
@@ -89,13 +93,32 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
     server = ThreadingHTTPServer(("127.0.0.1", 0), Receiver)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    assigned_worker = None
+    if setup_url and setup_url.endswith('/assignment'):
+        repository = tmp_path / 'r'
+        (repository / 'packages/shared').mkdir(parents=True)
+        manifest = {'name': 'worker-fixture', 'version': '1.0.0', 'workspaces': ['packages/shared']}
+        child = {'name': '@fixture/shared', 'version': '1.0.0'}
+        (repository / 'package.json').write_text(json.dumps(manifest), encoding='utf-8')
+        (repository / 'packages/shared/package.json').write_text(json.dumps(child), encoding='utf-8')
+        (repository / 'package-lock.json').write_text(json.dumps({'lockfileVersion': 3, 'packages': {
+            '': manifest, 'packages/shared': child, 'node_modules/@fixture/shared': {'resolved': 'packages/shared', 'link': True}}}), encoding='utf-8')
+        remote = tmp_path / 'origin.git'
+        subprocess.run(['git', 'init', '--bare', '-q', str(remote)], check=True)
+        subprocess.run(['git', 'init', '-q', str(repository)], check=True)
+        subprocess.run(['git', '-C', str(repository), 'remote', 'add', 'origin', str(remote)], check=True)
+        subprocess.run(['git', '-C', str(repository), 'add', 'package.json', 'package-lock.json', 'packages/shared/package.json'], check=True)
+        subprocess.run(['git', '-C', str(repository), '-c', 'user.name=Fixture', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'gateway input'], check=True)
+        commit = subprocess.check_output(['git', '-C', str(repository), 'rev-parse', 'HEAD'], text=True).strip()
+        assigned_worker = post(setup_url, {'workspace': str(repository), 'home': os.environ['HERMES_HOME'], 'origin': str(remote), 'baseCommit': commit})
 
     def setup(tid, attempt, workspace, environment):
         nonlocal principal, run_id, dispatch_id
         remote = tmp_path / "origin.git"
-        subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
-        subprocess.run(["git", "-C", str(workspace), "checkout", "-qb", "codex/signed-fixture"], check=True)
-        subprocess.run(["git", "-C", str(workspace), "remote", "add", "origin", str(remote)], check=True)
+        if not assigned_worker:
+            subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+            subprocess.run(["git", "-C", str(workspace), "checkout", "-qb", "codex/signed-fixture"], check=True)
+            subprocess.run(["git", "-C", str(workspace), "remote", "add", "origin", str(remote)], check=True)
         key = tmp_path / "receipt.secret"
         key.write_text(secret, encoding="utf-8")
         base = f"http://127.0.0.1:{server.server_port}"
@@ -106,7 +129,7 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
             "principalId": principal, "role": "technical-acceptor", "workerId": tid,
             "expectedBranch": "codex/signed-fixture", "secretFile": str(key),
             "stateUrl": base + "/state", "submitUrl": base + "/submit", "hermesTaskId": tid, "hermesBoard": "probe"}
-        if setup_url:
+        if setup_url and not assigned_worker:
             seed = workspace / "seed.md"
             seed.write_text("disposable initial state\n", encoding="utf-8")
             subprocess.run(["git", "-C", str(workspace), "add", "seed.md"], check=True)
@@ -114,6 +137,10 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
             commit = subprocess.check_output(["git", "-C", str(workspace), "rev-parse", "HEAD"], text=True).strip()
             supplied = post(setup_url, {"taskId": tid, "attempt": attempt, "workspace": str(workspace),
                 "home": environment["HERMES_HOME"], "origin": str(remote), "baseCommit": commit})
+        if setup_url:
+            if assigned_worker:
+                supplied = assigned_worker
+                assert tid == supplied['hermesTaskId']
             upstream.update(stateUrl=supplied["stateUrl"], submitUrl=supplied["submitUrl"])
             context.update(supplied)
             context.update(stateUrl=base + "/state", submitUrl=base + "/submit", secretFile=str(key))
@@ -127,7 +154,7 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
 
     try:
         exercise = runpy.run_path(str(Path(__file__).with_name("test_controller_model_boundary.py")))["test_supervised_agent_saves_git_output_and_fresh_observer_certifies_exit"]
-        exercise(tmp_path, cli_completion=True, trailing_tool=False, receipt_setup=setup)
+        exercise(tmp_path, cli_completion=True, trailing_tool=False, receipt_setup=setup, assigned_worker=assigned_worker)
         assert not failures, failures
         assert len(received) == 1
         receipt = received[0]
