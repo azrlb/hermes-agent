@@ -30,6 +30,7 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
     run_id, dispatch_id = "my244-signed-worker-fixture", "a" * 64
     received, failures = [], []
     upstream = {}
+    active_task_id = None
     setup_url = os.environ.get("HERMES_TEST_CONTROLLER_SETUP_URL")
     if setup_url:
         assert urlparse(setup_url).hostname == "127.0.0.1", "controller harness must be disposable loopback"
@@ -50,11 +51,11 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
         def do_POST(self):
             body = self.rfile.read(int(self.headers["Content-Length"]))
             try:
-                if self.path == "/state":
+                if self.path == "/state" or self.path.endswith('/state'):
                     response = post(upstream["stateUrl"], {}) if upstream else {
                         "request": {"runId": run_id}, "expectedEventSequence": 1,
                         "acceptedReceiptIds": [], "recoveryGeneration": 0}
-                elif self.path == "/submit":
+                elif self.path == "/submit" or self.path.endswith('/submitEvent'):
                     envelope = json.loads(body)
                     signature = envelope.pop("signature")
                     assert envelope["algorithm"] == "hmac-sha256"
@@ -73,7 +74,7 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
                     assert receipt["producer"]["principalId"] == principal
                     from hermes_cli import kanban_db as kb
                     with kb.connect_closing(board="probe") as conn:
-                        task = kb.get_task(conn, receipt["producer"]["workerId"])
+                        task = kb.get_task(conn, active_task_id)
                         assert task.status == "running" and task.current_run_id is not None
                     received.append(receipt)
                     response = post(upstream["submitUrl"], json.loads(body)) if upstream else {"staged": True}
@@ -110,10 +111,12 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
         subprocess.run(['git', '-C', str(repository), 'add', 'package.json', 'package-lock.json', 'packages/shared/package.json'], check=True)
         subprocess.run(['git', '-C', str(repository), '-c', 'user.name=Fixture', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'gateway input'], check=True)
         commit = subprocess.check_output(['git', '-C', str(repository), 'rev-parse', 'HEAD'], text=True).strip()
-        assigned_worker = post(setup_url, {'workspace': str(repository), 'home': os.environ['HERMES_HOME'], 'origin': str(remote), 'baseCommit': commit})
+        assigned_worker = post(setup_url, {'workspace': str(repository), 'home': os.environ['HERMES_HOME'], 'origin': str(remote), 'baseCommit': commit,
+            'receiptBase': f'http://127.0.0.1:{server.server_port}'})
 
     def setup(tid, attempt, workspace, environment):
-        nonlocal principal, run_id, dispatch_id
+        nonlocal principal, run_id, dispatch_id, active_task_id
+        active_task_id = tid
         remote = tmp_path / "origin.git"
         if not assigned_worker:
             subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
@@ -141,14 +144,21 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
             if assigned_worker:
                 supplied = assigned_worker
                 assert tid == supplied['hermesTaskId']
-            upstream.update(stateUrl=supplied["stateUrl"], submitUrl=supplied["submitUrl"])
+            upstream.update(stateUrl=supplied.get('nativeStateUrl', supplied['stateUrl']), submitUrl=supplied.get('nativeSubmitUrl', supplied['submitUrl']))
             context.update(supplied)
             context.update(stateUrl=base + "/state", submitUrl=base + "/submit", secretFile=str(key))
             principal = context["principalId"]
             run_id, dispatch_id = context["request"]["runId"], context["request"]["dispatchId"]
             environment["HERMES_TEST_WORKER_ARTIFACT"] = f"_bmad-output/orchestrator-runs/{run_id}/worker-evidence.md"
-        context_path = tmp_path / "receipt-context.json"
-        context_path.write_text(json.dumps(context), encoding="utf-8")
+        if assigned_worker:
+            context_path = Path(assigned_worker['contextFile'])
+            generated = json.loads(context_path.read_text(encoding='utf-8'))
+            assert generated['request'] == assigned_worker['request']
+            assert generated['hermesTaskId'] == tid
+            Path(generated['secretFile']).write_text(secret, encoding='utf-8')
+        else:
+            context_path = tmp_path / "receipt-context.json"
+            context_path.write_text(json.dumps(context), encoding="utf-8")
         environment["PATH"] = str(root / ".venv" / "Scripts") + os.pathsep + environment["PATH"]
         return f'"{node}" "{cli}" --context "{context_path}" --artifact "{environment.get("HERMES_TEST_WORKER_ARTIFACT", "worker-evidence.md")}"'
 
