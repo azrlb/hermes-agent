@@ -85,7 +85,7 @@ def test_controller_requires_exact_prepared_worktree(kanban_home, tmp_path, case
     if case != "legacy":
         metadata["preparedWorkspace"] = {"version": 1 if case == "unpinned" else 2, "path": str(target), "branch": expected_branch, "inputCommit": input_commit}
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="controller assignment", body="<!-- codex-bmad-lifecycle " + json.dumps(metadata) + " -->",
+        tid = kb.create_task(conn, title="controller assignment", assignee="default", body="<!-- codex-bmad-lifecycle " + json.dumps(metadata) + " -->",
                              workspace_kind="worktree", workspace_path=str(target), branch_name=expected_branch)
         task = kb.get_task(conn, tid)
     before = subprocess.check_output(["git", "-C", str(repo), "worktree", "list", "--porcelain"], text=True)
@@ -94,6 +94,29 @@ def test_controller_requires_exact_prepared_worktree(kanban_home, tmp_path, case
     else:
         with pytest.raises(ValueError, match="controller.*prepared worktree"):
             kb._resolve_worktree_workspace(task, verify_input=True)
+        # Exercise the real database/claim/workspace dispatch path, not only
+        # its resolver. Invalid input must never reach even the launch boundary.
+        launch_calls = []
+
+        def forbidden_launch(*args, **kwargs):
+            launch_calls.append((args, kwargs))
+            raise AssertionError("invalid prepared input reached worker launch")
+
+        with kb.connect() as conn:
+            dispatched = kb.dispatch_once(conn, spawn_fn=forbidden_launch)
+        assert dispatched.spawned == []
+        assert launch_calls == []
+        # Reopen the database to prove the failure and absent worker survive
+        # connection loss. This is not a claimed process-exit certificate.
+        with kb.connect() as conn:
+            failed = conn.execute(
+                "SELECT worker_pid, claim_lock, consecutive_failures, last_failure_error "
+                "FROM tasks WHERE id = ?", (tid,),
+            ).fetchone()
+            assert failed["worker_pid"] is None
+            assert failed["claim_lock"] is None
+            assert failed["consecutive_failures"] == 1
+            assert "exact prepared worktree" in failed["last_failure_error"]
     assert subprocess.check_output(["git", "-C", str(repo), "worktree", "list", "--porcelain"], text=True) == before
     if case != "missing":
         assert (target / "saved-work.txt").read_text(encoding="utf-8") == "preserve this"
@@ -161,4 +184,3 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert head == "wt/sibling"
-
