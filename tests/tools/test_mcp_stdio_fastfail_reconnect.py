@@ -124,3 +124,42 @@ def test_midcall_child_exit_signals_reconnect(monkeypatch, tmp_path):
         assert server._reconnect_event.set_calls == 1
     finally:
         _cleanup(mcp_tool, "srv-midcall")
+
+
+@pytest.mark.parametrize("async_rpc", [True, False])
+def test_child_watcher_is_created_once_only_when_raced(monkeypatch, tmp_path, async_rpc):
+    """Capability detection must not create and abandon an extra coroutine."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import mcp_tool
+
+    reply = MagicMock(is_error=False, content=[])
+
+    async def call_async(*args, **kwargs):
+        return reply
+
+    server = _install_stub_server(
+        mcp_tool, "srv-single-watch", call_async if async_rpc else lambda *a, **kw: reply,
+        children_dead=lambda: False,
+    )
+    created = []
+
+    async def wait_for_children():
+        await asyncio.Event().wait()
+
+    def make_watcher():
+        watcher = wait_for_children()
+        created.append(watcher)
+        return watcher
+
+    server._watch_stdio_children = make_watcher
+    mcp_tool._ensure_mcp_loop()
+    try:
+        result = json.loads(mcp_tool._make_tool_handler("srv-single-watch", "tool1", 10.0)({}))
+        assert "error" not in result, result
+        assert len(created) == (1 if async_rpc else 0)
+        assert all(watcher.cr_frame is None for watcher in created), "watcher was not drained"
+    finally:
+        # Also close any abandoned coroutine on the failing-before code path.
+        for watcher in created:
+            watcher.close()
+        _cleanup(mcp_tool, "srv-single-watch")

@@ -6184,11 +6184,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         )
                     _call_coro = server.session.call_tool(tool_name, arguments=args)
                     _watch_children = getattr(server, "_watch_stdio_children", None)
-                    _watch_ok = (
-                        _watch_children is not None
-                        and inspect.isawaitable(_watch_children())
-                        and asyncio.iscoroutine(_call_coro)
+                    # Create the watcher only when there is an RPC to race,
+                    # and retain that same awaitable. Calling its factory as a
+                    # capability probe leaked an unused coroutine on every call.
+                    _watch_coro = (
+                        _watch_children()
+                        if asyncio.iscoroutine(_call_coro) and callable(_watch_children)
+                        else None
                     )
+                    _watch_ok = inspect.isawaitable(_watch_coro)
                     if not _watch_ok:
                         # Stubbed sessions (MagicMock in tests) return a
                         # non-awaitable, or there is no child-watcher to race
@@ -6205,7 +6209,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         # the call immediately instead of riding out the full
                         # tool timeout.
                         rpc_task = asyncio.ensure_future(_call_coro)
-                        watch_task = asyncio.ensure_future(_watch_children())
+                        watch_task = asyncio.ensure_future(_watch_coro)
                         try:
                             done, _pending = await asyncio.wait(
                                 {rpc_task, watch_task},
