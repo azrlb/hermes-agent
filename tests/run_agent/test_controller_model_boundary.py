@@ -124,11 +124,6 @@ def test_supervised_agent_saves_git_output_and_fresh_observer_certifies_exit(tmp
             resolved, branch = kb._resolve_worktree_workspace(assigned, board="probe")
             assert Path(resolved) == workspace
             assert branch == assigned_worker["expectedBranch"]
-        task = kb.claim_task(conn, tid)
-        run_id = task.current_run_id
-        environment.update(HERMES_KANBAN_TASK=tid, HERMES_KANBAN_RUN_ID=str(run_id),
-                           HERMES_KANBAN_EXIT_RECORD=str(kb._worker_exit_record_path(tid, run_id, board="probe")))
-        receipt_command = receipt_setup(tid, run_id, workspace, environment) if receipt_setup else ""
         code = """
 import runpy, sys
 from pathlib import Path
@@ -139,17 +134,46 @@ with pytest.MonkeyPatch.context() as isolated:
 print('WORKER_ASSERTIONS_PASSED', flush=True)
 kb.write_kanban_worker_exit_record(0)
 """
-        command = prepare_worker_command(conn, tid, run_id,
-                                         [sys.executable, "-u", "-c", code, str(Path(__file__).resolve()), str(workspace), str(cli_completion), str(trailing_tool), receipt_command])
-        worker = subprocess.Popen(command, cwd=root, env=environment, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
-        kb._set_worker_pid(conn, tid, worker.pid)
+        worker = None
+        run_id = None
+
+        def launch_controlled_model(task, workspace_path, board=None):
+            nonlocal worker, run_id
+            assert task.id == tid and Path(workspace_path) == workspace
+            assert board == "probe" and worker is None
+            run_id = task.current_run_id
+            assert run_id is not None
+            environment.update(HERMES_KANBAN_TASK=tid, HERMES_KANBAN_RUN_ID=str(run_id),
+                               HERMES_KANBAN_EXIT_RECORD=str(kb._worker_exit_record_path(tid, run_id, board=board)))
+            receipt_command = receipt_setup(tid, run_id, workspace, environment) if receipt_setup else ""
+            command = prepare_worker_command(conn, tid, run_id,
+                                             [sys.executable, "-u", "-c", code, str(Path(__file__).resolve()), str(workspace), str(cli_completion), str(trailing_tool), receipt_command])
+            worker = subprocess.Popen(command, cwd=root, env=environment, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            return worker.pid
+
         try:
+            if assigned_worker:
+                from hermes_cli.profiles import get_profile_dir
+
+                # Seed only the disposable assignment's profile. Do not bypass
+                # the dispatcher's real profile eligibility check.
+                profile = get_profile_dir(assigned.assignee)
+                assert profile.is_relative_to(Path(os.environ["HERMES_HOME"]))
+                profile.mkdir(parents=True, exist_ok=True)
+                dispatched = kb.dispatch_once(conn, board="probe", max_spawn=1,
+                                              spawn_fn=launch_controlled_model)
+                assert [item[0] for item in dispatched.spawned] == [tid], dispatched
+                assert kb.get_task(conn, tid).worker_pid == worker.pid
+            else:
+                task = kb.claim_task(conn, tid)
+                kb._set_worker_pid(conn, tid, launch_controlled_model(task, str(workspace), board="probe"))
+            assert worker is not None
             stdout, stderr = worker.communicate(timeout=75)
             assert worker.returncode == 0, (stdout, stderr)
             assert 'WORKER_ASSERTIONS_PASSED' in stdout, (stdout, stderr)
         finally:
-            if worker.poll() is None:
+            if worker is not None and worker.poll() is None:
                 kb.stop_task(conn, tid, reason="dispose controlled model test")
                 worker.communicate(timeout=20)
     # This process did not own the Popen handle or its in-memory exit cache.
