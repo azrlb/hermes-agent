@@ -207,7 +207,14 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
         if setup_url:
             # Keep the disposable board and Git remote alive until the real
             # controller has independently consumed both pieces of evidence.
-            post(setup_url.rsplit("/", 1)[0] + "/finish", {"receiptId": receipt["receiptId"]})
+            endpoint = setup_url.rsplit("/", 1)[0] + "/finish"
+            result = post(endpoint, {"receiptId": receipt["receiptId"]})
+            deadline = time.monotonic() + 90
+            while result.get("status") == "pending" and time.monotonic() < deadline:
+                time.sleep(0.25)
+                result = post(endpoint + "-result", {})
+            assert result.get("status") == "verified", result
+            assert result["acceptedReceiptIds"] == [receipt["receiptId"]], result
         completed = True
     finally:
         server.shutdown()
