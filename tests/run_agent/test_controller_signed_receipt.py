@@ -113,6 +113,13 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
         commit = subprocess.check_output(['git', '-C', str(repository), 'rev-parse', 'HEAD'], text=True).strip()
         assigned_worker = post(setup_url, {'workspace': str(repository), 'home': os.environ['HERMES_HOME'], 'origin': str(remote), 'baseCommit': commit,
             'receiptBase': f'http://127.0.0.1:{server.server_port}'})
+        if assigned_worker.get('pending'):
+            deadline = time.monotonic() + 90
+            while assigned_worker.get('pending') and time.monotonic() < deadline:
+                time.sleep(0.25)
+                assigned_worker = post(setup_url + '-result', {})
+            assert 'assignment' in assigned_worker, 'the same controller setup operation did not finish'
+            assigned_worker = assigned_worker['assignment']
 
     def setup(tid, attempt, workspace, environment):
         nonlocal principal, run_id, dispatch_id, active_task_id
@@ -163,7 +170,7 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
         return f'"{node}" "{cli}" --context "{context_path}" --artifact "{environment.get("HERMES_TEST_WORKER_ARTIFACT", "worker-evidence.md")}"'
 
     try:
-        if assigned_worker and assigned_worker.get('controlMode') == 'cancel':
+        if assigned_worker and assigned_worker.get('controlMode') in ('cancel', 'pause', 'revise'):
             exercise_busy = runpy.run_path(str(Path(__file__).with_name('controller_busy_worker_fixture.py')))['exercise_busy_worker_cancel']
             exercise_busy(assigned_worker, setup_url.rsplit('/', 1)[0] + '/control', post)
             assert received == [] and failures == []

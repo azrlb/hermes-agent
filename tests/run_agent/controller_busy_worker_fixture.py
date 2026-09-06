@@ -58,7 +58,8 @@ while True:
             before = heartbeat.read_text()
             time.sleep(0.15)
             assert heartbeat.read_text() != before, 'child must be actively writing before cancellation'
-            assert post(control_url, {'taskId': task_id, 'attempt': attempt})['status'] == 'cancelled'
+            mode = assignment['controlMode']
+            assert post(control_url, {'taskId': task_id, 'attempt': attempt})['status'] == ('cancelled' if mode == 'cancel' else 'held')
             assert worker.wait(timeout=15) != 0
             if psutil.pid_exists(child['pid']):
                 assert psutil.Process(child['pid']).create_time() != child['started'], 'owned child survived cancellation'
@@ -85,6 +86,15 @@ with kb.connect_closing(board='probe') as conn:
             final = heartbeat.read_text()
             time.sleep(0.15)
             assert heartbeat.read_text() == final
+            if mode != 'cancel':
+                result = post(control_url + '-finished', {'taskId': task_id, 'attempt': attempt})
+                deadline = time.monotonic() + 90
+                while result['status'] == 'pending' and time.monotonic() < deadline:
+                    time.sleep(0.25)
+                    result = post(control_url + '-finished-result', {})
+                assert result['status'] == 'verified', result
+                assert heartbeat.read_text() == final
+                assert evidence.read_text() == 'preserve busy worker output\n'
         finally:
             if worker is not None and worker.poll() is None:
                 stopped = kb.stop_task(conn, task_id, reason='dispose failed busy-worker test')
