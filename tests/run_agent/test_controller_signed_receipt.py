@@ -163,6 +163,11 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
         return f'"{node}" "{cli}" --context "{context_path}" --artifact "{environment.get("HERMES_TEST_WORKER_ARTIFACT", "worker-evidence.md")}"'
 
     try:
+        if assigned_worker and assigned_worker.get('controlMode') == 'cancel':
+            exercise_busy = runpy.run_path(str(Path(__file__).with_name('controller_busy_worker_fixture.py')))['exercise_busy_worker_cancel']
+            exercise_busy(assigned_worker, setup_url.rsplit('/', 1)[0] + '/control', post)
+            assert received == [] and failures == []
+            return
         exercise = runpy.run_path(str(Path(__file__).with_name("test_controller_model_boundary.py")))["test_supervised_agent_saves_git_output_and_fresh_observer_certifies_exit"]
         exercise(tmp_path, cli_completion=True, trailing_tool=False, receipt_setup=setup, assigned_worker=assigned_worker)
         assert not failures, failures
