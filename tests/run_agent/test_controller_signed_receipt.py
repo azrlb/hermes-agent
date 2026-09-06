@@ -196,8 +196,11 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
         if assigned_worker and assigned_worker.get('exitFirst'):
             outbox = tmp_path / 'exit-first-envelope.json'
             helper = Path(__file__).with_name('prepare_exit_first_receipt.cjs')
-            return subprocess.list2cmdline([node, str(helper), cli, str(context_path),
-                environment['HERMES_TEST_WORKER_ARTIFACT'], str(outbox), sys.executable])
+            # The terminal tool uses a shell; list2cmdline targets CreateProcess
+            # and leaves no-space Windows paths unquoted, losing backslashes.
+            arguments = [node, str(helper), cli, str(context_path),
+                environment['HERMES_TEST_WORKER_ARTIFACT'], str(outbox), sys.executable]
+            return ' '.join(json.dumps(argument.replace('\\', '/')) for argument in arguments)
         return f'"{node}" "{cli}" --context "{context_path}" --artifact "{environment.get("HERMES_TEST_WORKER_ARTIFACT", "worker-evidence.md")}"'
 
     try:
