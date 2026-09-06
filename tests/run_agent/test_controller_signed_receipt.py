@@ -204,6 +204,27 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
         assert blob == b"verified fixture output\n"
         assert receipt["artifacts"][0]["sha256"] == hashlib.sha256(blob).hexdigest()
         assert receipt["checks"][0]["sha256"] == hashlib.sha256(blob).hexdigest()
+        if assigned_worker and assigned_worker.get("callbackLoss"):
+            from hermes_cli import kanban_db as kb
+            dropped = []
+            def drop_exit_delivery(url, payload):
+                if payload.get("payload", {}).get("type") == "worker-exited":
+                    dropped.append(payload)
+                    raise ConnectionError("disposable injected callback loss before delivery")
+                return post(url, payload)
+            with kb.connect_closing(board="probe") as conn:
+                before = dict(conn.execute("SELECT * FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (active_task_id,)).fetchone())
+                assert before["worker_exited_at"] and before["worker_exit_code"] == 0
+                assert kb.deliver_worker_exit_certificates(conn, board="probe", key_id="hermes-lifecycle-v1",
+                    secret="disposable-lifecycle-secret", transport=drop_exit_delivery) == []
+                after = dict(conn.execute("SELECT * FROM task_runs WHERE id=?", (before["id"],)).fetchone())
+                assert len(dropped) == 1
+                assert after["worker_exit_delivery_attempts"] == before["worker_exit_delivery_attempts"] + 1
+                assert after["worker_exit_delivered_at"] is None
+                for field in ("worker_pid", "process_started_at", "worker_exited_at", "worker_exit_code", "worker_exit_kind", "outcome"):
+                    assert after[field] == before[field]
+            result = post(setup_url.rsplit("/", 1)[0] + "/callback-loss-recorded", {})
+            assert result == {"pollingReleased": True}
         if setup_url:
             # Keep the disposable board and Git remote alive until the real
             # controller has independently consumed both pieces of evidence.
