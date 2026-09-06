@@ -183,6 +183,10 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
             principal = context["principalId"]
             run_id, dispatch_id = context["request"]["runId"], context["request"]["dispatchId"]
             environment["HERMES_TEST_WORKER_ARTIFACT"] = f"_bmad-output/orchestrator-runs/{run_id}/worker-evidence.md"
+            if assigned_worker and assigned_worker.get('repairReview'):
+                # Each real worker saves separate Git evidence; the reviewer
+                # must not produce an empty commit by rewriting the repair file.
+                environment["HERMES_TEST_WORKER_ARTIFACT"] = f"_bmad-output/orchestrator-runs/{run_id}/{dispatch_id}.md"
         if assigned_worker:
             context_path = Path(assigned_worker['contextFile'])
             generated = json.loads(context_path.read_text(encoding='utf-8'))
@@ -230,6 +234,29 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
         assert blob == b"verified fixture output\n"
         assert receipt["artifacts"][0]["sha256"] == hashlib.sha256(blob).hexdigest()
         assert receipt["checks"][0]["sha256"] == hashlib.sha256(blob).hexdigest()
+        if assigned_worker and assigned_worker.get('repairReview'):
+            repair_assignment = assigned_worker
+            repair_receipt = receipt
+            endpoint = setup_url.rsplit('/', 1)[0] + '/next-review'
+            result = post(endpoint, {})
+            deadline = time.monotonic() + 90
+            while result.get('pending') and time.monotonic() < deadline:
+                time.sleep(0.25)
+                result = post(endpoint, {})
+            assert 'assignment' in result, result
+            assigned_worker = result['assignment']
+            assert assigned_worker['principalId'] != repair_assignment['principalId']
+            assert assigned_worker['hermesTaskId'] != repair_assignment['hermesTaskId']
+            assert assigned_worker['request']['baseCommit'] == repair_receipt['source']['commit']
+            # Run another genuine supervised worker through the generated
+            # assignment, receipt CLI, receiver and fresh exit observer.
+            exercise(tmp_path, cli_completion=True, trailing_tool=False, receipt_setup=setup, assigned_worker=assigned_worker)
+            assert failures == [] and len(received) == 2, failures
+            receipt = received[1]
+            assert receipt['producer']['principalId'] == assigned_worker['principalId']
+            repair_blob = subprocess.check_output(['git', '--git-dir', str(tmp_path / 'origin.git'), 'show',
+                f"{receipt['source']['commit']}:{artifact_path}"])
+            assert repair_blob == blob, 'independent review lost the saved repair evidence'
         if assigned_worker and assigned_worker.get("callbackLoss"):
             from hermes_cli import kanban_db as kb
             dropped = []
@@ -261,7 +288,7 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
                 time.sleep(0.25)
                 result = post(endpoint + "-result", {})
             assert result.get("status") == "verified", result
-            assert result["acceptedReceiptIds"] == [receipt["receiptId"]], result
+            assert result["acceptedReceiptIds"] == [item["receiptId"] for item in received], result
         completed = True
     finally:
         server.shutdown()
