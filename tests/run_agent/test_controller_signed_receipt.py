@@ -186,7 +186,7 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
             if assigned_worker and assigned_worker.get('repairReview'):
                 # Each real worker saves separate Git evidence; the reviewer
                 # must not produce an empty commit by rewriting the repair file.
-                environment["HERMES_TEST_WORKER_ARTIFACT"] = f"_bmad-output/orchestrator-runs/{run_id}/{dispatch_id}.md"
+                environment["HERMES_TEST_WORKER_ARTIFACT"] = f"_bmad-output/orchestrator-runs/{run_id}/e{supplied['request']['eventSequence']}.md"
         if assigned_worker:
             context_path = Path(assigned_worker['contextFile'])
             generated = json.loads(context_path.read_text(encoding='utf-8'))
