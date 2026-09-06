@@ -1290,14 +1290,15 @@ class TestBuildSafeEnv:
         with patch.dict("os.environ", fake_env, clear=True):
             result = _build_safe_env(None)
 
-        assert result["ProgramFiles"] == r"C:\Program Files"
-        assert result["ProgramData"] == r"C:\ProgramData"
-        assert result["ProgramW6432"] == r"C:\Program Files"
-        assert result["LOCALAPPDATA"].endswith("Local")
-        assert result["APPDATA"].endswith("Roaming")
-        assert result["USERPROFILE"] == r"C:\Users\alice"
-        assert "GITHUB_TOKEN" not in result
-        assert "OPENAI_API_KEY" not in result
+        # Native Windows os.environ enumerates upper-case names; POSIX retains
+        # the supplied spelling. Verify every allowed value and secret exclusion
+        # using Windows' case-insensitive key semantics, without faking the OS.
+        normalized = {key.upper(): value for key, value in result.items()}
+        assert len(normalized) == len(result), "duplicate case variants are ambiguous"
+        assert normalized == {
+            key.upper(): value for key, value in fake_env.items()
+            if key not in {"GITHUB_TOKEN", "OPENAI_API_KEY"}
+        }
 
 
 # ---------------------------------------------------------------------------
