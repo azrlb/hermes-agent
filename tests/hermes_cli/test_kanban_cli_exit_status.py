@@ -58,3 +58,18 @@ def test_delegated_child_kanban_cli_refusal_returns_nonzero_exit_status(tmp_path
 
     assert refused.returncode == 1
     assert "delegate_task child contexts cannot mutate Kanban tasks via the CLI" in refused.stderr
+
+
+def test_stop_cli_refuses_missing_expected_attempt(tmp_path):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    created = _run_hermes(home, "kanban", "create", "exact stop probe", "--json")
+    assert created.returncode == 0, created.stderr
+    task_id = json.loads(created.stdout)["id"]
+    refused = _run_hermes(home, "kanban", "stop", task_id, "--reason", "stale recovery",
+                          "--expected-run-id", "1", "--json")
+    assert refused.returncode == 1, refused.stderr
+    assert json.loads(refused.stdout) == {"stopped": False, "reason": "attempt_changed"}
+    stopped = _run_hermes(home, "kanban", "stop", task_id, "--reason", "dispose unclaimed fixture", "--json")
+    assert stopped.returncode == 0, stopped.stderr
+    assert json.loads(stopped.stdout)["never_started"] is True

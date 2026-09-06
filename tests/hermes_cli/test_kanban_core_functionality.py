@@ -1339,6 +1339,15 @@ def test_stop_task_acknowledges_only_after_worker_is_gone(kanban_home, monkeypat
         def survives(_pid, _sig):
             return None
 
+        def must_not_signal(_pid, _sig):
+            raise AssertionError("Stale attempt stop signalled a worker")
+
+        before = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
+        stale = kb.stop_task(conn, task_id, reason="stale recovery", expected_run_id=run_id + 1,
+                             signal_fn=must_not_signal)
+        assert stale == {"stopped": False, "reason": "attempt_changed"}
+        assert dict(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()) == before
+
         refused = kb.stop_task(conn, task_id, reason="controller cancel", signal_fn=survives)
         assert refused["stopped"] is False
         assert refused["reason"] == "worker_alive"
@@ -1348,13 +1357,13 @@ def test_stop_task_acknowledges_only_after_worker_is_gone(kanban_home, monkeypat
             if sig == signal.SIGTERM:
                 state["alive"] = False
 
-        accepted = kb.stop_task(conn, task_id, reason="controller cancel", signal_fn=stops)
+        accepted = kb.stop_task(conn, task_id, reason="controller cancel", signal_fn=stops, expected_run_id=run_id)
         assert accepted["stopped"] is True
         assert accepted["status"] == "blocked"
         task = kb.get_task(conn, task_id)
         assert task.status == "blocked"
         assert task.worker_pid is None
-        replay = kb.stop_task(conn, task_id, reason="controller cancel", signal_fn=stops)
+        replay = kb.stop_task(conn, task_id, reason="controller cancel", signal_fn=stops, expected_run_id=run_id)
         assert replay == {"stopped": True, "status": "blocked", "already_terminal": True}
     finally:
         conn.close()

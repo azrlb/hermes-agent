@@ -259,7 +259,12 @@ sys.exit(int(sys.argv[2]))
             assert child.is_running()
             assert kb.get_task(conn, tid).status == "done"
         if mode.startswith("controller-stop"):
-            stopped = kb.stop_task(conn, tid, reason="disposable full-tree stop")
+            before = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
+            stale = kb.stop_task(conn, tid, reason="stale exact-attempt stop", expected_run_id=run_id + 1)
+            assert stale == {"stopped": False, "reason": "attempt_changed"}
+            assert child.is_running()
+            assert dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()) == before
+            stopped = kb.stop_task(conn, tid, reason="disposable full-tree stop", expected_run_id=run_id)
             assert stopped["stopped"] is True
             child.wait(timeout=5)
             worker.communicate(timeout=15)
@@ -271,7 +276,7 @@ sys.exit(int(sys.argv[2]))
             ).fetchone()[0] == 1
             conn.close()
             conn = kb.connect()
-            assert kb.stop_task(conn, tid, reason="reopened stop replay")["stopped"] is True
+            assert kb.stop_task(conn, tid, reason="reopened stop replay", expected_run_id=run_id)["stopped"] is True
             assert kb.certify_terminal_worker_exits(conn, tid) == [tid]
             assert conn.execute(
                 "SELECT worker_exit_kind FROM task_runs WHERE id = ?", (run_id,),

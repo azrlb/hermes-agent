@@ -5313,6 +5313,7 @@ def stop_task(
     *,
     reason: str,
     signal_fn=None,
+    expected_run_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """Stop a host-local worker and terminally park its task.
 
@@ -5322,6 +5323,8 @@ def stop_task(
     """
     if not reason or reason.strip() != reason or len(reason) > 500:
         raise ValueError("stop reason must be non-empty, trimmed, and at most 500 characters")
+    if expected_run_id is not None and (type(expected_run_id) is not int or expected_run_id <= 0):
+        raise ValueError("expected stop attempt must be a positive integer")
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid, current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
@@ -5330,6 +5333,13 @@ def stop_task(
     run = conn.execute(
         "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
+    # Recovery callers pin an attempt, not whichever worker happens to own the
+    # task now. Check before any signal or job termination. The captured unique
+    # Windows job remains this attempt's target if a later claim races the stop;
+    # the existing conditional terminal update rejects changed ownership.
+    if expected_run_id is not None and (run is None or run["id"] != expected_run_id
+            or row["current_run_id"] not in (None, expected_run_id)):
+        return {"stopped": False, "reason": "attempt_changed"}
     windows_stop = _IS_WINDOWS and signal_fn is None
     terminal = row["status"] in ("done", "archived", "blocked") and row["claim_lock"] is None
     prelaunch_only = False

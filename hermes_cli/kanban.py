@@ -552,6 +552,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_stop.add_argument("task_id")
     p_stop.add_argument("--reason", required=True)
+    p_stop.add_argument("--expected-run-id", type=int, default=None,
+                        help="Refuse before signalling if this attempt no longer owns the task")
     p_stop.add_argument("--json", action="store_true")
 
     p_reassign = sub.add_parser(
@@ -2032,7 +2034,8 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 
 def _cmd_stop(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        result = kb.stop_task(conn, args.task_id, reason=args.reason)
+        result = kb.stop_task(conn, args.task_id, reason=args.reason,
+                              expected_run_id=getattr(args, "expected_run_id", None))
     if getattr(args, "json", False):
         print(json.dumps(result))
     elif result.get("stopped"):
