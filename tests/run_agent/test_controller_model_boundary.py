@@ -192,7 +192,12 @@ assert Path(os.environ['HERMES_KANBAN_DB']).is_file()
                 task = kb.claim_task(conn, tid)
                 kb._set_worker_pid(conn, tid, launch_controlled_model(task, str(workspace), board="probe"))
             assert worker is not None
-            stdout, stderr = worker.communicate(timeout=75)
+            try:
+                stdout, stderr = worker.communicate(timeout=75)
+            except subprocess.TimeoutExpired as error:
+                log_path = kb.worker_logs_dir(board="probe") / f"{tid}.log"
+                log = log_path.read_text(encoding="utf-8", errors="replace") if assigned_worker and log_path.is_file() else str(error.output or '')
+                raise AssertionError(f"Supervised disposable worker {tid} exceeded75 seconds; captured log:\n{log[-32000:]}") from error
             if assigned_worker:
                 stdout = (kb.worker_logs_dir(board="probe") / f"{tid}.log").read_text(encoding="utf-8")
             assert worker.returncode == 0, (stdout, stderr)

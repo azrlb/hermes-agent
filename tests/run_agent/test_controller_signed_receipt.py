@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from urllib.request import Request, urlopen
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -290,6 +291,16 @@ def test_real_worker_submits_signed_receipt_before_exact_attempt_completion(tmp_
             assert result.get("status") == "verified", result
             assert result["acceptedReceiptIds"] == [item["receiptId"] for item in received], result
         completed = True
+    except BaseException:
+        # Report before fixture teardown can retire the board or the outer
+        # runner times out. This is diagnostic evidence, never a receipt.
+        failure = traceback.format_exc()
+        if setup_url:
+            try:
+                post(setup_url.rsplit('/', 1)[0] + '/worker-failure', {'error': failure[-64000:]})
+            except Exception:
+                print(failure, file=sys.stderr, flush=True)
+        raise
     finally:
         server.shutdown()
         server.server_close()
