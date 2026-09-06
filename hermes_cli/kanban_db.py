@@ -5380,6 +5380,8 @@ def stop_task(
     elif prelaunch_only:
         termination = {"never_started": True, "termination_attempted": False,
                        "terminated": False, "host_local": True, "prev_pid": None}
+    elif terminal and windows_stop and run:
+        return {"stopped": False, "reason": "process_tree_identity_missing"}
     elif terminal:
         return {"stopped": True, "status": row["status"], "already_terminal": True}
     else:

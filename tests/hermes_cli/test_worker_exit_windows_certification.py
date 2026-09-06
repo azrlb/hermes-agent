@@ -43,15 +43,15 @@ def test_stop_never_started_task_without_inventing_an_exit(monkeypatch, concurre
 
 
 @pytest.mark.windows_only
-@pytest.mark.parametrize("case", ["prelaunch-only", "ambiguous-prior", "concurrent-claim"])
+@pytest.mark.parametrize("case", ["prelaunch-only", "ambiguous-prior", "ambiguous-blocked", "concurrent-claim"])
 def test_stop_failed_claim_requires_durable_prelaunch_proof(case, monkeypatch):
     kb.init_db()
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="disposable failed claim", assignee="default")
         for index in range(2):
             assert kb.claim_task(conn, tid)
-            kb._record_spawn_failure(conn, tid, "disposable failure", failure_limit=10,
-                                     launch_not_attempted=not (case == "ambiguous-prior" and index == 0))
+            kb._record_spawn_failure(conn, tid, "disposable failure", failure_limit=2 if case == "ambiguous-blocked" else 10,
+                                     launch_not_attempted=not (case.startswith("ambiguous") and index == 0))
         if case == "concurrent-claim":
             survived = kb._worker_survived_termination
             def claim_before_update(termination):
