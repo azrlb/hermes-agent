@@ -5332,6 +5332,26 @@ def stop_task(
     ).fetchone()
     windows_stop = _IS_WINDOWS and signal_fn is None
     terminal = row["status"] in ("done", "archived", "blocked") and row["claim_lock"] is None
+    prelaunch_only = False
+    if (run and row["current_run_id"] is None and row["worker_pid"] is None
+            and row["claim_lock"] is None):
+        # A claim can fail workspace validation before the launcher is called.
+        # Persist that fact at failure time; absence of a PID alone is not proof.
+        # Earlier ambiguous attempts must not be hidden by a later safe failure.
+        attempts = conn.execute("SELECT * FROM task_runs WHERE task_id=? ORDER BY id", (task_id,)).fetchall()
+        prelaunch_only = True
+        for attempt in attempts:
+            try:
+                metadata = json.loads(attempt["metadata"] or "{}")
+            except (TypeError, ValueError):
+                metadata = None
+            if (not isinstance(metadata, dict) or metadata.get("worker_launch_not_attempted") is not True
+                    or attempt["outcome"] not in ("spawn_failed", "gave_up")
+                    or attempt["ended_at"] is None or attempt["worker_pid"] is not None
+                    or attempt["process_started_at"] is not None or attempt["worker_job_name"]
+                    or attempt["worker_job_attached"]):
+                prelaunch_only = False
+                break
     if windows_stop and run and run["worker_pid"]:
         from hermes_cli.kanban_worker_job import job_is_empty, terminate_job
         if terminal and job_is_empty(run["worker_job_name"], bool(run["worker_job_attached"]),
@@ -5355,6 +5375,9 @@ def stop_task(
         # No attempt has ever existed. Do not demand a process-exit record
         # for a process that was never launched. The update below still checks
         # both ownership and latest-run identity against a concurrent claim.
+        termination = {"never_started": True, "termination_attempted": False,
+                       "terminated": False, "host_local": True, "prev_pid": None}
+    elif prelaunch_only:
         termination = {"never_started": True, "termination_attempted": False,
                        "terminated": False, "host_local": True, "prev_pid": None}
     elif terminal:
@@ -5383,7 +5406,7 @@ def stop_task(
         )
         if cur.rowcount != 1:
             return {"stopped": False, "reason": "ownership_changed"}
-        if windows_stop and run:
+        if windows_stop and run and not termination.get("never_started"):
             # TerminateJobObject + observed zero membership proves a stop,
             # not successful completion. Preserve that distinction durably.
             conn.execute(
@@ -9991,6 +10014,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    launch_not_attempted: bool = False,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -10098,6 +10122,7 @@ def _record_task_failure(
                         "effective_limit": effective_limit,
                         "limit_source": limit_source,
                         "retry_status": retry_status,
+                        **({"worker_launch_not_attempted": True} if launch_not_attempted else {}),
                     },
                 )
             payload = {
@@ -10141,6 +10166,7 @@ def _record_task_failure(
                     metadata={
                         "failures": failures,
                         "retry_status": retry_status,
+                        **({"worker_launch_not_attempted": True} if launch_not_attempted else {}),
                     },
                 )
                 _append_event(
@@ -10164,6 +10190,7 @@ def _record_spawn_failure(
     error: str,
     *,
     failure_limit: int = None,
+    launch_not_attempted: bool = False,
 ) -> bool:
     return _record_task_failure(
         conn, task_id, error,
@@ -10171,6 +10198,7 @@ def _record_spawn_failure(
         failure_limit=failure_limit,
         release_claim=True,
         end_run=True,
+        launch_not_attempted=launch_not_attempted,
     )
 
 
@@ -11092,6 +11120,7 @@ def _dispatch_once_locked(
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
+                launch_not_attempted=True,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
@@ -11219,6 +11248,7 @@ def _dispatch_once_locked(
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
+                launch_not_attempted=True,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)

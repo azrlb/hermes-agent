@@ -117,6 +117,13 @@ def test_controller_requires_exact_prepared_worktree(kanban_home, tmp_path, case
             assert failed["claim_lock"] is None
             assert failed["consecutive_failures"] == 1
             assert "exact prepared worktree" in failed["last_failure_error"]
+            stopped = kb.stop_task(conn, tid, reason="park rejected input")
+            assert stopped["stopped"] is True
+            assert stopped["never_started"] is True
+            attempt = conn.execute("SELECT * FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+            assert attempt["worker_pid"] is None
+            assert attempt["worker_exited_at"] is None
+            assert not attempt["worker_job_drained"]
     assert subprocess.check_output(["git", "-C", str(repo), "worktree", "list", "--porcelain"], text=True) == before
     if case != "missing":
         assert (target / "saved-work.txt").read_text(encoding="utf-8") == "preserve this"

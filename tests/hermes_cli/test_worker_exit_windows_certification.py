@@ -42,6 +42,34 @@ def test_stop_never_started_task_without_inventing_an_exit(monkeypatch, concurre
         assert kb.stop_task(conn, tid, reason="repeat cancellation")["stopped"] is True
 
 
+@pytest.mark.windows_only
+@pytest.mark.parametrize("case", ["prelaunch-only", "ambiguous-prior", "concurrent-claim"])
+def test_stop_failed_claim_requires_durable_prelaunch_proof(case, monkeypatch):
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="disposable failed claim", assignee="default")
+        for index in range(2):
+            assert kb.claim_task(conn, tid)
+            kb._record_spawn_failure(conn, tid, "disposable failure", failure_limit=10,
+                                     launch_not_attempted=not (case == "ambiguous-prior" and index == 0))
+        if case == "concurrent-claim":
+            survived = kb._worker_survived_termination
+            def claim_before_update(termination):
+                assert kb.claim_task(conn, tid)
+                return survived(termination)
+            monkeypatch.setattr(kb, "_worker_survived_termination", claim_before_update)
+        stopped = kb.stop_task(conn, tid, reason="park prelaunch failure")
+        if case == "prelaunch-only":
+            assert stopped["stopped"] is True and stopped["never_started"] is True
+            assert kb.get_task(conn, tid).status == "blocked"
+        else:
+            assert stopped["stopped"] is False
+            assert not stopped.get("never_started") or stopped.get("reason") == "ownership_changed"
+        for attempt in conn.execute("SELECT * FROM task_runs WHERE task_id=?", (tid,)):
+            assert attempt["worker_pid"] is None and attempt["worker_exited_at"] is None
+            assert not attempt["worker_job_drained"]
+
+
 def _dashboard_status_writer(root):
     spec = importlib.util.spec_from_file_location(
         "my244_windows_dashboard", root / "plugins/kanban/dashboard/plugin_api.py",
